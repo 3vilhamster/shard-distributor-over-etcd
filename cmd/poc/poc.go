@@ -14,9 +14,9 @@ import (
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"google.golang.org/grpc"
 
+	"github.com/3vilhamster/shard-distributor-over-etcd/gen/proto"
 	"github.com/3vilhamster/shard-distributor-over-etcd/pkg/client"
 	"github.com/3vilhamster/shard-distributor-over-etcd/pkg/server"
-	"github.com/3vilhamster/shard-distributor-over-etcd/proto"
 )
 
 var (
@@ -136,7 +136,7 @@ func runClient(ctx context.Context) {
 		go func() {
 			// Wait a bit before killing the first instance
 			time.Sleep(20 * time.Second)
-			log.Printf("Simulating failure of instance %s", instances[0].(*client.ServiceInstance).InstanceID)
+			log.Printf("Simulating failure of instance %s", instances[0].InstanceID())
 			instances[0].Shutdown(context.Background())
 			instances = instances[1:]
 		}()

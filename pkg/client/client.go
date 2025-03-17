@@ -62,6 +62,10 @@ func NewServiceInstance(instanceID, endpoint, distributorAddr string) (*ServiceI
 	return instance, nil
 }
 
+func (si *ServiceInstance) InstanceID() string {
+	return si.instanceID
+}
+
 // Start registers the instance and starts watching for shard assignments
 func (si *ServiceInstance) Start(ctx context.Context) error {
 	// Register with the distributor
