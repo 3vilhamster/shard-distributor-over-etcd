@@ -1,0 +1,79 @@
+syntax = "proto3";
+
+package sharddistributor;
+
+option go_package = "github.com/3vilhamster/shard-distributor-over-etcd/proto";
+
+// ShardDistributor service provides fast shard distribution notifications
+service ShardDistributor {
+  // WatchShardAssignments opens a stream for the instance to receive shard assignments
+  rpc WatchShardAssignments(InstanceInfo) returns (stream ShardAssignment) {}
+
+  // ReportStatus allows instances to report their status and metrics
+  rpc ReportStatus(StatusReport) returns (StatusResponse) {}
+
+  // RegisterInstance registers a new service instance
+  rpc RegisterInstance(InstanceInfo) returns (RegisterResponse) {}
+
+  // DeregisterInstance gracefully deregisters a service instance
+  rpc DeregisterInstance(InstanceInfo) returns (DeregisterResponse) {}
+}
+
+// InstanceInfo contains information about a service instance
+message InstanceInfo {
+  string instance_id = 1;
+  string endpoint = 2;
+  int32 capacity = 3;
+  map<string, string> metadata = 4;
+}
+
+// ShardAssignment represents a shard being assigned or revoked
+message ShardAssignment {
+  enum Action {
+    ASSIGN = 0;
+    PREPARE = 1;
+    REVOKE = 2;
+  }
+
+  string shard_id = 1;
+  Action action = 2;
+  int32 priority = 3;  // Higher numbers = higher priority
+  string source_instance_id = 4;  // For transfers
+}
+
+// StatusReport contains instance status and metrics
+message StatusReport {
+  string instance_id = 1;
+  enum Status {
+    ACTIVE = 0;
+    DRAINING = 1;
+    OVERLOADED = 2;
+  }
+  Status status = 2;
+
+  // Metrics
+  double cpu_usage = 3;
+  double memory_usage = 4;
+  int32 active_shard_count = 5;
+  int32 standby_shard_count = 6;
+  map<string, double> custom_metrics = 7;
+}
+
+// StatusResponse acknowledges a status report
+message StatusResponse {
+  bool acknowledged = 1;
+  string message = 2;
+}
+
+// RegisterResponse for instance registration
+message RegisterResponse {
+  bool success = 1;
+  string message = 2;
+  repeated string assigned_shards = 3;
+}
+
+// DeregisterResponse for instance deregistration
+message DeregisterResponse {
+  bool success = 1;
+  string message = 2;
+}
