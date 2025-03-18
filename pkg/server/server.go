@@ -3,16 +3,16 @@ package server
 import (
 	"context"
 	"fmt"
-	"log"
+	"reflect"
 	"sync"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.etcd.io/etcd/client/v3/concurrency"
-
-	"github.com/3vilhamster/shard-distributor-over-etcd/pkg/sharding"
+	"go.uber.org/zap"
 
 	"github.com/3vilhamster/shard-distributor-over-etcd/gen/proto"
+	"github.com/3vilhamster/shard-distributor-over-etcd/pkg/sharding"
 )
 
 // ShardDistributorServer implements the ShardDistributor gRPC service
@@ -27,6 +27,8 @@ type ShardDistributorServer struct {
 	isLeader         bool
 	election         *concurrency.Election
 	leaderChan       chan bool
+	session          *concurrency.Session
+	logger           *zap.Logger
 }
 
 // InstanceData contains information about a service instance
@@ -37,11 +39,11 @@ type InstanceData struct {
 }
 
 // NewShardDistributorServer creates a new shard distributor server
-func NewShardDistributorServer(etcdClient *clientv3.Client) (*ShardDistributorServer, error) {
+func NewShardDistributorServer(logger *zap.Logger, etcdClient *clientv3.Client) (*ShardDistributorServer, error) {
 	// Create a session for leader election
 	session, err := concurrency.NewSession(etcdClient, concurrency.WithTTL(5))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("create etcd session: %w", err)
 	}
 
 	// Create election
@@ -55,6 +57,8 @@ func NewShardDistributorServer(etcdClient *clientv3.Client) (*ShardDistributorSe
 		hashStrategy:     sharding.NewConsistentHashStrategy(100), // 100 virtual nodes
 		election:         election,
 		leaderChan:       make(chan bool, 1),
+		session:          session,
+		logger:           logger,
 	}
 
 	// Start leadership campaign
@@ -74,7 +78,7 @@ func (s *ShardDistributorServer) RegisterInstance(
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	log.Printf("Instance registered: %s at %s", req.InstanceId, req.Endpoint)
+	s.logger.Info("Instance registered", zap.String("instance", req.InstanceId), zap.String("endpoint", req.Endpoint))
 
 	// Store instance information
 	s.instances[req.InstanceId] = &InstanceData{
@@ -83,9 +87,17 @@ func (s *ShardDistributorServer) RegisterInstance(
 		LastHeartbeat: time.Now(),
 	}
 
-	// Register in etcd
+	// Register in etcd with TTL lease for automatic cleanup if instance fails
+	lease, err := s.etcdClient.Grant(ctx, 30) // 30-second TTL
+	if err != nil {
+		return &proto.RegisterResponse{
+			Success: false,
+			Message: fmt.Sprintf("Failed to create lease in etcd: %v", err),
+		}, nil
+	}
+
 	key := fmt.Sprintf("/services/%s", req.InstanceId)
-	_, err := s.etcdClient.Put(ctx, key, req.Endpoint)
+	_, err = s.etcdClient.Put(ctx, key, req.Endpoint, clientv3.WithLease(lease.ID))
 	if err != nil {
 		return &proto.RegisterResponse{
 			Success: false,
@@ -93,9 +105,23 @@ func (s *ShardDistributorServer) RegisterInstance(
 		}, nil
 	}
 
+	go func() {
+		// Keep lease alive in background
+		ch, err := s.etcdClient.KeepAlive(context.Background(), lease.ID)
+		if err != nil {
+			s.logger.Error("Failed to keep lease alive for instance", zap.String("instance", req.InstanceId), zap.Error(err))
+			return
+		}
+
+		// Consume keep alive responses
+		for range ch {
+			// Just consume to keep channel unblocked
+		}
+	}()
+
 	// If we're the leader, recalculate shard distribution
 	if s.isLeader {
-		s.recalculateShardDistribution()
+		go s.recalculateShardDistribution()
 	}
 
 	// Return the currently assigned shards to this instance
@@ -121,7 +147,7 @@ func (s *ShardDistributorServer) DeregisterInstance(
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	log.Printf("Instance deregistered: %s", req.InstanceId)
+	s.logger.Info("Instance deregistered", zap.String("instance", req.InstanceId))
 
 	// Remove from etcd
 	key := fmt.Sprintf("/services/%s", req.InstanceId)
@@ -137,7 +163,8 @@ func (s *ShardDistributorServer) DeregisterInstance(
 	delete(s.instances, req.InstanceId)
 
 	// Close all streams to this instance
-	for _, stream := range s.instanceStreams[req.InstanceId] {
+	streams := s.instanceStreams[req.InstanceId]
+	for _, stream := range streams {
 		// Notifying that we're closing the stream
 		stream.Send(&proto.ShardAssignment{
 			ShardId: "shutdown",
@@ -148,7 +175,7 @@ func (s *ShardDistributorServer) DeregisterInstance(
 
 	// If we're the leader, recalculate shard distribution
 	if s.isLeader {
-		s.recalculateShardDistribution()
+		go s.recalculateShardDistribution()
 	}
 
 	return &proto.DeregisterResponse{
@@ -178,13 +205,17 @@ func (s *ShardDistributorServer) ReportStatus(
 	needsRecalculation := instance.Status.Status != proto.StatusReport_DRAINING &&
 		req.Status == proto.StatusReport_DRAINING
 
+	if needsRecalculation {
+		s.logger.Info("Instance transitioning to DRAINING state", zap.String("instance", req.InstanceId))
+	}
+
 	// Update status and heartbeat
 	instance.Status = req
 	instance.LastHeartbeat = time.Now()
 
 	// If instance is draining and we're the leader, recalculate distribution
 	if needsRecalculation && s.isLeader {
-		s.recalculateShardDistribution()
+		go s.recalculateShardDistribution()
 	}
 
 	return &proto.StatusResponse{
@@ -199,7 +230,7 @@ func (s *ShardDistributorServer) WatchShardAssignments(
 	stream proto.ShardDistributor_WatchShardAssignmentsServer,
 ) error {
 	instanceID := req.InstanceId
-	log.Printf("Instance %s started watching for shard assignments", instanceID)
+	s.logger.Info("Instance started watching for shard assignments", zap.String("instance", req.InstanceId))
 
 	// Store the stream for this instance
 	s.mu.Lock()
@@ -223,7 +254,7 @@ func (s *ShardDistributorServer) WatchShardAssignments(
 	// Send initial assignments
 	for _, assignment := range currentAssignments {
 		if err := stream.Send(assignment); err != nil {
-			log.Printf("Error sending initial assignment to %s: %v", instanceID, err)
+			s.logger.Error("Error sending initial assignment", zap.String("instance", req.InstanceId), zap.Error(err))
 			return err
 		}
 	}
@@ -244,7 +275,7 @@ func (s *ShardDistributorServer) WatchShardAssignments(
 		}
 	}
 
-	log.Printf("Instance %s stopped watching for shard assignments", instanceID)
+	s.logger.Info("Instance stopped watching for shard assignments", zap.String("instance", req.InstanceId))
 	return nil
 }
 
@@ -254,7 +285,7 @@ func (s *ShardDistributorServer) campaignForLeadership() {
 		// Try to become leader
 		err := s.election.Campaign(context.Background(), "candidate")
 		if err != nil {
-			log.Printf("Failed to campaign for leadership: %v", err)
+			s.logger.Warn("Failed to campaign for leadership", zap.Error(err))
 			time.Sleep(time.Second)
 			continue
 		}
@@ -264,7 +295,7 @@ func (s *ShardDistributorServer) campaignForLeadership() {
 		s.isLeader = true
 		s.mu.Unlock()
 
-		log.Println("Became leader for shard distribution")
+		s.logger.Info("Became leader for shard distribution")
 
 		// Recalculate distribution
 		s.recalculateShardDistribution()
@@ -275,12 +306,17 @@ func (s *ShardDistributorServer) campaignForLeadership() {
 		// Block until leadership changes
 		<-ch
 
-		log.Println("Leadership changed, no longer leader")
+		s.logger.Info("Leadership changed, no longer leader")
 
 		s.mu.Lock()
 		s.isLeader = false
 		s.mu.Unlock()
 	}
+}
+
+// distributionsEqual compares two shard distribution maps for equality
+func distributionsEqual(a, b map[string]string) bool {
+	return reflect.DeepEqual(a, b)
 }
 
 // recalculateShardDistribution recalculates shard distribution after changes
@@ -292,8 +328,6 @@ func (s *ShardDistributorServer) recalculateShardDistribution() {
 	if !s.isLeader {
 		return
 	}
-
-	log.Println("Recalculating shard distribution")
 
 	// Convert instances to the format needed by the consistent hash strategy
 	activeInstances := make(map[string]sharding.InstanceInfo)
@@ -314,6 +348,23 @@ func (s *ShardDistributorServer) recalculateShardDistribution() {
 	// Calculate new distribution
 	newDistribution := s.hashStrategy.CalculateDistribution(s.shardAssignments, activeInstances)
 
+	// Check if the distribution changed before proceeding
+	if distributionsEqual(s.shardAssignments, newDistribution) {
+		// No changes in distribution, skip the rest
+		return
+	}
+
+	// Log distribution change summary
+	changes := 0
+	for shardID, newInstanceID := range newDistribution {
+		oldInstanceID, exists := s.shardAssignments[shardID]
+		if !exists || oldInstanceID != newInstanceID {
+			changes++
+		}
+	}
+
+	s.logger.Info("Distribution changed", zap.Int("shard_affected", changes))
+
 	// Identify changes
 	assignmentsToSend := make(map[string][]*proto.ShardAssignment)
 
@@ -322,14 +373,16 @@ func (s *ShardDistributorServer) recalculateShardDistribution() {
 		newInstanceID, exists := newDistribution[shardID]
 		if !exists || newInstanceID != oldInstanceID {
 			// Shard is no longer assigned to the old instance
-			if _, ok := assignmentsToSend[oldInstanceID]; !ok {
-				assignmentsToSend[oldInstanceID] = make([]*proto.ShardAssignment, 0)
-			}
+			if oldInstanceID != "" {
+				if _, ok := assignmentsToSend[oldInstanceID]; !ok {
+					assignmentsToSend[oldInstanceID] = make([]*proto.ShardAssignment, 0)
+				}
 
-			assignmentsToSend[oldInstanceID] = append(assignmentsToSend[oldInstanceID], &proto.ShardAssignment{
-				ShardId: shardID,
-				Action:  proto.ShardAssignment_REVOKE,
-			})
+				assignmentsToSend[oldInstanceID] = append(assignmentsToSend[oldInstanceID], &proto.ShardAssignment{
+					ShardId: shardID,
+					Action:  proto.ShardAssignment_REVOKE,
+				})
+			}
 		}
 	}
 
@@ -338,24 +391,26 @@ func (s *ShardDistributorServer) recalculateShardDistribution() {
 		oldInstanceID, exists := s.shardAssignments[shardID]
 		if !exists || oldInstanceID != newInstanceID {
 			// Shard is newly assigned to the new instance
-			if _, ok := assignmentsToSend[newInstanceID]; !ok {
-				assignmentsToSend[newInstanceID] = make([]*proto.ShardAssignment, 0)
-			}
+			if newInstanceID != "" {
+				if _, ok := assignmentsToSend[newInstanceID]; !ok {
+					assignmentsToSend[newInstanceID] = make([]*proto.ShardAssignment, 0)
+				}
 
-			// First send prepare if it's a transfer
-			if exists {
+				// First send prepare if it's a transfer
+				if exists && oldInstanceID != "" {
+					assignmentsToSend[newInstanceID] = append(assignmentsToSend[newInstanceID], &proto.ShardAssignment{
+						ShardId:          shardID,
+						Action:           proto.ShardAssignment_PREPARE,
+						SourceInstanceId: oldInstanceID,
+					})
+				}
+
+				// Then send assign
 				assignmentsToSend[newInstanceID] = append(assignmentsToSend[newInstanceID], &proto.ShardAssignment{
-					ShardId:          shardID,
-					Action:           proto.ShardAssignment_PREPARE,
-					SourceInstanceId: oldInstanceID,
+					ShardId: shardID,
+					Action:  proto.ShardAssignment_ASSIGN,
 				})
 			}
-
-			// Then send assign
-			assignmentsToSend[newInstanceID] = append(assignmentsToSend[newInstanceID], &proto.ShardAssignment{
-				ShardId: shardID,
-				Action:  proto.ShardAssignment_ASSIGN,
-			})
 		}
 	}
 
@@ -366,7 +421,6 @@ func (s *ShardDistributorServer) recalculateShardDistribution() {
 	for instanceID, assignments := range assignmentsToSend {
 		streams, exists := s.instanceStreams[instanceID]
 		if !exists || len(streams) == 0 {
-			// Store assignments for when instance connects
 			continue
 		}
 
@@ -375,22 +429,27 @@ func (s *ShardDistributorServer) recalculateShardDistribution() {
 			for _, assignment := range assignments {
 				err := stream.Send(assignment)
 				if err != nil {
-					log.Printf("Error sending assignment to %s: %v", instanceID, err)
+					s.logger.Warn("Error sending assignment", zap.String("instance", instanceID), zap.Error(err))
 				}
 			}
 		}
 	}
 
 	// Update assignments in etcd
+	batch := s.etcdClient.Txn(context.Background())
+	var ops []clientv3.Op
 	for shardID, instanceID := range newDistribution {
 		key := fmt.Sprintf("/shards/%s", shardID)
-		_, err := s.etcdClient.Put(context.Background(), key, instanceID)
-		if err != nil {
-			log.Printf("Error updating shard assignment in etcd: %v", err)
-		}
+		ops = append(ops, clientv3.OpPut(key, instanceID))
 	}
 
-	log.Println("Shard distribution recalculated and notifications sent")
+	// Execute batch operation if there are assignments to update
+	if len(ops) > 0 {
+		_, err := batch.Then(ops...).Commit()
+		if err != nil {
+			s.logger.Warn("Error updating shard assignments in etcd", zap.Error(err))
+		}
+	}
 }
 
 // checkInstanceHealth periodically checks for unhealthy instances
@@ -401,33 +460,35 @@ func (s *ShardDistributorServer) checkInstanceHealth() {
 	for range ticker.C {
 		s.mu.Lock()
 		now := time.Now()
+		unhealthy := 0
 
 		// Check for instances that haven't sent a heartbeat recently
 		for id, instance := range s.instances {
 			if now.Sub(instance.LastHeartbeat) > time.Second*15 {
-				log.Printf("Instance %s appears to be unhealthy, removing", id)
-
 				// Remove from our instances map
 				delete(s.instances, id)
+				unhealthy++
 
 				// Remove from etcd
 				key := fmt.Sprintf("/services/%s", id)
 				_, err := s.etcdClient.Delete(context.Background(), key)
 				if err != nil {
-					log.Printf("Error removing unhealthy instance from etcd: %v", err)
+					s.logger.Warn("Error removing unhealthy instance from etcd", zap.Error(err))
 				}
 
 				// Close streams
 				delete(s.instanceStreams, id)
-
-				// Recalculate if leader
-				if s.isLeader {
-					go s.recalculateShardDistribution()
-				}
 			}
 		}
 
+		needsRecalculation := unhealthy > 0 && s.isLeader
 		s.mu.Unlock()
+
+		// Recalculate if we found unhealthy instances and we're the leader
+		if needsRecalculation {
+			s.logger.Info("Recalculating distribution", zap.Int("unhealth_instances", unhealthy))
+			s.recalculateShardDistribution()
+		}
 	}
 }
 
@@ -436,7 +497,7 @@ func (s *ShardDistributorServer) LoadShardDefinitions(ctx context.Context, numSh
 	// Check if shards are already defined
 	resp, err := s.etcdClient.Get(ctx, "/shards/", clientv3.WithPrefix())
 	if err != nil {
-		return fmt.Errorf("error checking for existing shards: %v", err)
+		return fmt.Errorf("checking for existing shards: %w", err)
 	}
 
 	s.mu.Lock()
@@ -444,6 +505,7 @@ func (s *ShardDistributorServer) LoadShardDefinitions(ctx context.Context, numSh
 
 	// If shards already exist, load them
 	if len(resp.Kvs) > 0 {
+		s.logger.Info("Loading shards", zap.Int("existing_shards", len(resp.Kvs)))
 		for _, kv := range resp.Kvs {
 			shardID := string(kv.Key)[len("/shards/"):]
 			instanceID := string(kv.Value)
@@ -452,18 +514,24 @@ func (s *ShardDistributorServer) LoadShardDefinitions(ctx context.Context, numSh
 		return nil
 	}
 
+	s.logger.Info("Initializing shards", zap.Int("new_shards", numShards))
+
 	// Initialize shards
+	var ops []clientv3.Op
 	for i := 0; i < numShards; i++ {
 		shardID := fmt.Sprintf("shard-%d", i)
 		// Don't assign to any instance yet
 		s.shardAssignments[shardID] = ""
 
-		// Store in etcd
+		// Add to batch operation
 		key := fmt.Sprintf("/shards/%s", shardID)
-		_, err := s.etcdClient.Put(ctx, key, "")
-		if err != nil {
-			return fmt.Errorf("error initializing shard %s: %v", shardID, err)
-		}
+		ops = append(ops, clientv3.OpPut(key, ""))
+	}
+
+	// Execute batch operation
+	_, err = s.etcdClient.Txn(ctx).Then(ops...).Commit()
+	if err != nil {
+		return fmt.Errorf("initializing shards: %w", err)
 	}
 
 	return nil

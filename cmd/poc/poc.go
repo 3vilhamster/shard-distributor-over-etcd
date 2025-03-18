@@ -12,6 +12,7 @@ import (
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.uber.org/zap"
 	"google.golang.org/grpc"
 
 	"github.com/3vilhamster/shard-distributor-over-etcd/gen/proto"
@@ -33,9 +34,13 @@ var (
 func main() {
 	flag.Parse()
 
+	logger, err := zap.NewDevelopment()
+	if err != nil {
+		log.Fatalf("failed to initialize zap logger: %v", err)
+	}
+
 	if *mode == "" {
-		fmt.Println("Please specify mode: -mode=server or -mode=client")
-		os.Exit(1)
+		logger.Fatal("Please specify mode: -mode=server or -mode=client")
 	}
 
 	// Create etcd client
@@ -44,9 +49,14 @@ func main() {
 		DialTimeout: 5 * time.Second,
 	})
 	if err != nil {
-		log.Fatalf("Failed to connect to etcd: %v", err)
+		logger.Fatal("Failed to connect to etcd", zap.Error(err))
 	}
-	defer etcdClient.Close()
+	defer func(etcdClient *clientv3.Client) {
+		closeErr := etcdClient.Close()
+		if closeErr != nil {
+			logger.Error("Failed to close etcd", zap.Error(closeErr))
+		}
+	}(etcdClient)
 
 	// Set up signal handling for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
@@ -59,17 +69,17 @@ func main() {
 	}()
 
 	if *mode == "server" {
-		runServer(ctx, etcdClient)
+		runServer(ctx, logger, etcdClient)
 	} else if *mode == "client" {
-		runClient(ctx)
+		runClient(ctx, logger)
 	}
 }
 
-func runServer(ctx context.Context, etcdClient *clientv3.Client) {
+func runServer(ctx context.Context, logger *zap.Logger, etcdClient *clientv3.Client) {
 	log.Println("Starting shard distributor server...")
 
 	// Create the shard distributor server
-	s, err := server.NewShardDistributorServer(etcdClient)
+	s, err := server.NewShardDistributorServer(logger, etcdClient)
 	if err != nil {
 		log.Fatalf("Failed to create server: %v", err)
 	}
@@ -103,7 +113,7 @@ func runServer(ctx context.Context, etcdClient *clientv3.Client) {
 	log.Println("Server shut down")
 }
 
-func runClient(ctx context.Context) {
+func runClient(ctx context.Context, logger *zap.Logger) {
 	var instances []*client.ServiceInstance
 	baseID := *instanceID
 
@@ -118,7 +128,7 @@ func runClient(ctx context.Context) {
 		log.Printf("Starting service instance %s at %s", id, endpoint)
 
 		// Create the service instance
-		instance, err := client.NewServiceInstance(id, endpoint, *serverAddr)
+		instance, err := client.NewServiceInstance(id, endpoint, *serverAddr, logger)
 		if err != nil {
 			log.Fatalf("Failed to create service instance %s: %v", id, err)
 		}

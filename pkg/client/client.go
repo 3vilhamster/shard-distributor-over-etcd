@@ -3,10 +3,10 @@ package client
 import (
 	"context"
 	"fmt"
-	"log"
 	"sync"
 	"time"
 
+	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
@@ -26,6 +26,8 @@ type ServiceInstance struct {
 	status          proto.StatusReport_Status
 	isShuttingDown  bool
 	stopCh          chan struct{}
+
+	logger *zap.Logger
 }
 
 // ShardHandler manages processing for a single shard
@@ -38,9 +40,9 @@ type ShardHandler struct {
 }
 
 // NewServiceInstance creates a new service instance
-func NewServiceInstance(instanceID, endpoint, distributorAddr string) (*ServiceInstance, error) {
+func NewServiceInstance(instanceID, endpoint, distributorAddr string, logger *zap.Logger) (*ServiceInstance, error) {
 	// Create a connection to the distributor
-	conn, err := grpc.Dial(distributorAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(distributorAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to distributor: %v", err)
 	}
@@ -57,6 +59,7 @@ func NewServiceInstance(instanceID, endpoint, distributorAddr string) (*ServiceI
 		standbyShards:   make(map[string]*ShardHandler),
 		status:          proto.StatusReport_ACTIVE,
 		stopCh:          make(chan struct{}),
+		logger:          logger,
 	}
 
 	return instance, nil
@@ -80,14 +83,14 @@ func (si *ServiceInstance) Start(ctx context.Context) error {
 	})
 
 	if err != nil {
-		return fmt.Errorf("failed to register instance: %v", err)
+		return fmt.Errorf("register instance: %w", err)
 	}
 
 	if !resp.Success {
 		return fmt.Errorf("registration failed: %s", resp.Message)
 	}
 
-	log.Printf("Instance %s registered successfully", si.instanceID)
+	si.logger.Info("Instance registered successfully", zap.String("instance", si.instanceID))
 
 	// Start watching for shard assignments
 	go si.watchShardAssignments(ctx)
@@ -117,30 +120,30 @@ func (si *ServiceInstance) watchShardAssignments(ctx context.Context) {
 			})
 
 			if err != nil {
-				log.Printf("Error creating shard assignment stream: %v", err)
+				si.logger.Warn("Error creating shard assignment stream", zap.Error(err))
 				time.Sleep(time.Second)
 				continue
 			}
 
-			log.Printf("Started watching for shard assignments")
+			si.logger.Info("Started watching for shard assignments")
 
 			// Process shard assignments
 			for {
 				assignment, err := stream.Recv()
 				if err != nil {
-					log.Printf("Error receiving shard assignment: %v", err)
+					si.logger.Warn("Error receiving shard assignment", zap.Error(err))
 					break
 				}
 
 				// Special "shutdown" marker
 				if assignment.ShardId == "shutdown" {
-					log.Printf("Received shutdown signal from distributor")
+					si.logger.Info("Received shutdown signal from distributor")
 					return
 				}
 
 				// Process the assignment
-				log.Printf("Received shard assignment: %s - %s",
-					assignment.ShardId, assignment.Action)
+				si.logger.Info("Received shard assignment",
+					zap.String("shard", assignment.ShardId), zap.Stringer("action", assignment.Action))
 
 				switch assignment.Action {
 				case proto.ShardAssignment_ASSIGN:
@@ -188,7 +191,7 @@ func (si *ServiceInstance) reportStatus(ctx context.Context) {
 			})
 
 			if err != nil {
-				log.Printf("Error reporting status: %v", err)
+				si.logger.Error("Error reporting status", zap.Error(err))
 			}
 		}
 	}
@@ -214,8 +217,8 @@ func (si *ServiceInstance) activateShard(shardID string) {
 		handler.isActive = true
 		handler.isStandby = false
 		delete(si.standbyShards, shardID)
-		log.Printf("Fast activation of shard %s (prepared in %v)",
-			shardID, time.Since(startTime))
+		si.logger.Info("Fast activation of shard",
+			zap.String("shard", shardID), zap.Duration("latency", time.Since(startTime)))
 	} else {
 		// Create new handler
 		handler = &ShardHandler{
@@ -225,7 +228,7 @@ func (si *ServiceInstance) activateShard(shardID string) {
 			dataStore:   make(map[string]interface{}),
 			lastUpdated: time.Now(),
 		}
-		log.Printf("Regular activation of shard %s", shardID)
+		si.logger.Info("Regular activation of shard %s", zap.String("shard", shardID))
 
 		// Simulate loading initial state
 		time.Sleep(50 * time.Millisecond)
@@ -260,7 +263,7 @@ func (si *ServiceInstance) prepareShard(shardID string) {
 	}
 
 	si.standbyShards[shardID] = handler
-	log.Printf("Prepared shard %s for fast activation", shardID)
+	si.logger.Info("Prepared shard for fast activation", zap.String("shard", shardID))
 
 	// Simulate pre-loading data in background
 	go func() {
@@ -293,7 +296,7 @@ func (si *ServiceInstance) deactivateShard(shardID string) {
 	// Keep in standby for a short time in case of rapid reassignment
 	handler.isStandby = true
 	si.standbyShards[shardID] = handler
-	log.Printf("Deactivated shard %s (keeping in standby)", shardID)
+	si.logger.Info("Deactivated shard (keeping in standby)", zap.String("shard", shardID))
 
 	// Schedule cleanup after a delay
 	go func() {
@@ -305,7 +308,7 @@ func (si *ServiceInstance) deactivateShard(shardID string) {
 		// Clean up if still in standby
 		if standby, exists := si.standbyShards[shardID]; exists && standby.isStandby {
 			delete(si.standbyShards, shardID)
-			log.Printf("Cleaned up standby shard %s", shardID)
+			si.logger.Info("Cleaned up standby shard", zap.String("shard", shardID))
 		}
 	}()
 }
@@ -330,7 +333,7 @@ func (si *ServiceInstance) processShard(shardID string) {
 			}
 
 			// Simulate work
-			log.Printf("Processing work for shard %s", shardID)
+			si.logger.Info("Processing work for shard", zap.String("shard", shardID))
 		}
 	}
 }
@@ -347,7 +350,7 @@ func (si *ServiceInstance) Shutdown(ctx context.Context) error {
 	si.status = proto.StatusReport_DRAINING
 	si.mu.Unlock()
 
-	log.Printf("Beginning graceful shutdown of instance %s", si.instanceID)
+	si.logger.Info("Beginning graceful shutdown of instance", zap.String("instance", si.instanceID))
 
 	// Report draining status
 	_, err := si.client.ReportStatus(ctx, &proto.StatusReport{
@@ -358,7 +361,7 @@ func (si *ServiceInstance) Shutdown(ctx context.Context) error {
 	})
 
 	if err != nil {
-		log.Printf("Error reporting draining status: %v", err)
+		si.logger.Warn("Error reporting draining status", zap.Error(err))
 	}
 
 	// Wait for shards to be reassigned or timeout
@@ -387,7 +390,7 @@ func (si *ServiceInstance) Shutdown(ctx context.Context) error {
 	})
 
 	if err != nil {
-		log.Printf("Error deregistering instance: %v", err)
+		si.logger.Error("Error deregistering instance", zap.Error(err))
 	}
 
 	// Close connection
@@ -395,6 +398,6 @@ func (si *ServiceInstance) Shutdown(ctx context.Context) error {
 		si.conn.Close()
 	}
 
-	log.Printf("Instance %s shut down", si.instanceID)
+	si.logger.Info("Instance shut down", zap.String("instance", si.instanceID))
 	return nil
 }
