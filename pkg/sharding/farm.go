@@ -39,7 +39,6 @@ func (d *SimpleHashDistributor) CalculateDistribution(
 		return distribution
 	}
 
-	// Assign shards using farm hash and simple modulo
 	for shardID := range currentMap {
 		// Calculate hash using farmhash
 		hash := int(farm.Fingerprint32([]byte(shardID)))

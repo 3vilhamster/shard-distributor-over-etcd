@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"fmt"
+	"io"
 	"sync"
 	"time"
 
@@ -20,11 +21,15 @@ type ServiceInstance struct {
 	distributorAddr string
 	client          proto.ShardDistributorClient
 	conn            *grpc.ClientConn
+	stream          proto.ShardDistributor_ShardDistributorStreamClient
 	activeShards    map[string]*ShardHandler
 	standbyShards   map[string]*ShardHandler
+	shardVersions   map[string]int64
 	status          proto.StatusReport_Status
 	isShuttingDown  bool
 	stopCh          chan struct{}
+	streamDoneCh    chan struct{}
+	reconnectCh     chan struct{}
 	handoverTimings map[string]time.Time // Track handover timings
 
 	// Metrics for graceful transfer
@@ -44,12 +49,13 @@ type ShardHandler struct {
 	activatedAt  time.Time       // When this shard was activated
 	workItems    map[string]bool // Simulate work items in progress
 	processingMu sync.Mutex      // Mutex for work items
+	version      int64           // Current version of this shard assignment
 }
 
 // NewServiceInstance creates a new service instance
 func NewServiceInstance(instanceID, distributorAddr string, logger *zap.Logger) (*ServiceInstance, error) {
 	// Create a connection to the distributor
-	conn, err := grpc.NewClient(
+	conn, err := grpc.Dial(
 		distributorAddr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
@@ -65,8 +71,11 @@ func NewServiceInstance(instanceID, distributorAddr string, logger *zap.Logger) 
 		conn:              conn,
 		activeShards:      make(map[string]*ShardHandler),
 		standbyShards:     make(map[string]*ShardHandler),
+		shardVersions:     make(map[string]int64),
 		status:            proto.StatusReport_ACTIVE,
 		stopCh:            make(chan struct{}),
+		streamDoneCh:      make(chan struct{}),
+		reconnectCh:       make(chan struct{}, 1),
 		handoverTimings:   make(map[string]time.Time),
 		transferLatencies: make([]time.Duration, 0),
 		logger:            logger,
@@ -79,98 +88,369 @@ func (si *ServiceInstance) InstanceID() string {
 	return si.instanceID
 }
 
-// Start registers the instance and starts watching for shard assignments
+// Start registers the instance and starts the stream
 func (si *ServiceInstance) Start(ctx context.Context) error {
-	// Register with the distributor
-	resp, err := si.client.RegisterInstance(ctx, &proto.InstanceInfo{
+	// Start the streaming connection
+	if err := si.startStream(ctx); err != nil {
+		return err
+	}
+
+	// Start the goroutine to handle reconnections
+	go si.reconnectLoop(ctx)
+
+	// Start the goroutine to send periodic heartbeats
+	go si.heartbeatLoop(ctx)
+
+	// Start sending periodic status reports
+	go si.reportStatus(ctx)
+
+	return nil
+}
+
+// startStream establishes the bidirectional stream and registers the instance
+func (si *ServiceInstance) startStream(ctx context.Context) error {
+	// Create the stream
+	stream, err := si.client.ShardDistributorStream(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to create stream: %w", err)
+	}
+
+	si.stream = stream
+
+	// Register with the server
+	err = stream.Send(&proto.ClientMessage{
 		InstanceId: si.instanceID,
-		Capacity:   100,
-		Metadata: map[string]string{
-			"region": "us-west",
-			"zone":   "us-west-1a",
+		Type:       proto.ClientMessage_REGISTER,
+		InstanceInfo: &proto.InstanceInfo{
+			InstanceId: si.instanceID,
+			Capacity:   100,
+			Metadata: map[string]string{
+				"region": "us-west",
+				"zone":   "us-west-1a",
+			},
 		},
 	})
 
 	if err != nil {
-		return fmt.Errorf("register instance: %w", err)
+		return fmt.Errorf("failed to send registration: %w", err)
+	}
+
+	// Wait for registration response
+	resp, err := stream.Recv()
+	if err != nil {
+		return fmt.Errorf("failed to receive registration response: %w", err)
+	}
+
+	if resp.Type != proto.ServerMessage_REGISTER_RESPONSE {
+		return fmt.Errorf("unexpected response type: %v", resp.Type)
 	}
 
 	if !resp.Success {
 		return fmt.Errorf("registration failed: %s", resp.Message)
 	}
 
-	si.logger.Info("Instance registered successfully", zap.String("instance", si.instanceID))
+	si.logger.Info("Instance registered successfully",
+		zap.String("instance", si.instanceID),
+		zap.Int64("lease_id", resp.LeaseId))
 
 	// Start watching for shard assignments
-	go si.watchShardAssignments(ctx)
+	err = stream.Send(&proto.ClientMessage{
+		InstanceId: si.instanceID,
+		Type:       proto.ClientMessage_WATCH,
+	})
 
-	// Start reporting status periodically
-	go si.reportStatus(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to send watch request: %w", err)
+	}
+
+	si.logger.Info("Started watching for shard assignments")
+
+	// Start a goroutine to handle messages from the server
+	go si.handleServerMessages(stream)
 
 	// Activate any initially assigned shards
 	for _, shardID := range resp.AssignedShards {
-		si.activateShard(shardID)
+		si.activateShard(shardID, 0) // Use version 0 for initial assignments
 	}
 
 	return nil
 }
 
-// watchShardAssignments opens a stream to receive shard assignments
-func (si *ServiceInstance) watchShardAssignments(ctx context.Context) {
+// handleServerMessages processes messages coming from the server
+func (si *ServiceInstance) handleServerMessages(stream proto.ShardDistributor_ShardDistributorStreamClient) {
+	defer close(si.streamDoneCh)
+
+	var inReconciliation bool
+
+	for {
+		msg, err := stream.Recv()
+		if err != nil {
+			if err == io.EOF {
+				si.logger.Info("Stream closed by server")
+			} else {
+				si.logger.Warn("Error receiving from server", zap.Error(err))
+			}
+			select {
+			case <-si.stopCh:
+				// We're shutting down, so this is expected
+				return
+			default:
+				// Signal reconnection needed
+				select {
+				case si.reconnectCh <- struct{}{}:
+				default:
+					// Channel already has a pending reconnect
+				}
+				return
+			}
+		}
+
+		// Process different message types
+		switch msg.Type {
+		case proto.ServerMessage_SHARD_ASSIGNMENT:
+			// Handle special reconciliation messages
+			if msg.IsReconciliation {
+				if msg.ShardId == "reconciliation-start" {
+					inReconciliation = true
+					si.logger.Info("Starting shard ownership reconciliation")
+					continue
+				} else if msg.ShardId == "reconciliation-end" {
+					inReconciliation = false
+					si.logger.Info("Completed shard ownership reconciliation")
+					continue
+				}
+			}
+
+			// Log appropriately based on reconciliation status
+			if inReconciliation {
+				si.logger.Info("Received reconciliation assignment",
+					zap.String("shard", msg.ShardId),
+					zap.Stringer("action", msg.Action),
+					zap.Int64("version", msg.Version))
+			} else {
+				si.logger.Info("Received shard assignment",
+					zap.String("shard", msg.ShardId),
+					zap.Stringer("action", msg.Action),
+					zap.String("source", msg.SourceInstanceId),
+					zap.Int64("version", msg.Version))
+			}
+
+			// Process the assignment based on action
+			switch msg.Action {
+			case proto.ShardAssignmentAction_ASSIGN:
+				// Check version before processing
+				si.mu.RLock()
+				currentVersion, exists := si.shardVersions[msg.ShardId]
+				si.mu.RUnlock()
+
+				if exists && currentVersion > msg.Version && !msg.IsReconciliation {
+					si.logger.Info("Ignoring outdated shard assignment",
+						zap.String("shard", msg.ShardId),
+						zap.Int64("current_version", currentVersion),
+						zap.Int64("received_version", msg.Version))
+					continue
+				}
+
+				// Update version
+				si.mu.Lock()
+				si.shardVersions[msg.ShardId] = msg.Version
+				si.mu.Unlock()
+
+				// Record handover timing if this is a transfer
+				if msg.SourceInstanceId != "" {
+					si.recordHandoverStart(msg.ShardId)
+				}
+
+				// Activate shard
+				si.activateShard(msg.ShardId, msg.Version)
+
+				// Send acknowledgment
+				err = stream.Send(&proto.ClientMessage{
+					InstanceId: si.instanceID,
+					Type:       proto.ClientMessage_ACK,
+					ShardId:    msg.ShardId,
+				})
+				if err != nil {
+					si.logger.Warn("Failed to send assignment ACK", zap.Error(err))
+				}
+
+			case proto.ShardAssignmentAction_PREPARE:
+				si.prepareShard(msg.ShardId, msg.Version)
+
+				// Send acknowledgment
+				err = stream.Send(&proto.ClientMessage{
+					InstanceId: si.instanceID,
+					Type:       proto.ClientMessage_ACK,
+					ShardId:    msg.ShardId,
+				})
+				if err != nil {
+					si.logger.Warn("Failed to send prepare ACK", zap.Error(err))
+				}
+
+			case proto.ShardAssignmentAction_REVOKE:
+				si.deactivateShard(msg.ShardId)
+
+				// Send acknowledgment
+				err = stream.Send(&proto.ClientMessage{
+					InstanceId: si.instanceID,
+					Type:       proto.ClientMessage_ACK,
+					ShardId:    msg.ShardId,
+				})
+				if err != nil {
+					si.logger.Warn("Failed to send revoke ACK", zap.Error(err))
+				}
+			}
+
+		case proto.ServerMessage_HEARTBEAT_ACK:
+			// Nothing to do, heartbeat acknowledged
+
+		case proto.ServerMessage_STATUS_RESPONSE:
+			si.logger.Debug("Received status response",
+				zap.Bool("success", msg.Success),
+				zap.String("message", msg.Message))
+
+		default:
+			si.logger.Warn("Received unexpected message type",
+				zap.Int32("type", int32(msg.Type)))
+		}
+	}
+}
+
+// reconnectLoop handles reconnection when the stream is interrupted
+func (si *ServiceInstance) reconnectLoop(ctx context.Context) {
 	for {
 		select {
 		case <-si.stopCh:
 			return
-		default:
-			// Create watch stream
-			stream, err := si.client.WatchShardAssignments(ctx, &proto.InstanceInfo{
-				InstanceId: si.instanceID,
-			})
+		case <-si.reconnectCh:
+			// Wait for the current stream handling to finish
+			<-si.streamDoneCh
 
-			if err != nil {
-				si.logger.Warn("Error creating shard assignment stream", zap.Error(err))
-				time.Sleep(time.Second)
-				continue
+			// Don't reconnect if we're shutting down
+			if si.isShuttingDown {
+				return
 			}
 
-			si.logger.Info("Started watching for shard assignments")
+			// Exponential backoff for reconnection
+			backoff := 1 * time.Second
+			maxBackoff := 30 * time.Second
+			maxAttempts := 10
+			attempts := 0
 
-			// Process shard assignments
-			for {
-				assignment, err := stream.Recv()
-				if err != nil {
-					si.logger.Warn("Error receiving shard assignment", zap.Error(err))
+			for attempts < maxAttempts {
+				attempts++
+				si.logger.Info("Attempting to reconnect",
+					zap.Int("attempt", attempts),
+					zap.Duration("backoff", backoff))
+
+				// Try to reconnect
+				err := si.startStream(ctx)
+				if err == nil {
+					si.logger.Info("Reconnected successfully")
 					break
 				}
 
-				// Special "shutdown" marker
-				if assignment.ShardId == "shutdown" {
-					si.logger.Info("Received shutdown signal from distributor")
+				si.logger.Warn("Failed to reconnect",
+					zap.Error(err),
+					zap.Int("attempt", attempts))
+
+				// If max attempts reached, give up
+				if attempts >= maxAttempts {
+					si.logger.Error("Max reconnection attempts reached, giving up")
 					return
 				}
 
-				// Process the assignment
-				si.logger.Info("Received shard assignment",
-					zap.String("shard", assignment.ShardId),
-					zap.Stringer("action", assignment.Action),
-					zap.String("source", assignment.SourceInstanceId))
-
-				switch assignment.Action {
-				case proto.ShardAssignment_ASSIGN:
-					// When assignment includes source instance, it's part of a handover
-					if assignment.SourceInstanceId != "" {
-						si.recordHandoverStart(assignment.ShardId)
-					}
-					si.activateShard(assignment.ShardId)
-				case proto.ShardAssignment_PREPARE:
-					si.prepareShard(assignment.ShardId)
-				case proto.ShardAssignment_REVOKE:
-					si.deactivateShard(assignment.ShardId)
+				// Wait before next attempt
+				select {
+				case <-si.stopCh:
+					return
+				case <-time.After(backoff):
+					// Increase backoff for next attempt
+					backoff = min(backoff*2, maxBackoff)
 				}
 			}
+		}
+	}
+}
 
-			// If we get here, the stream was broken - try to reconnect after a delay
-			time.Sleep(time.Second)
+// heartbeatLoop sends periodic heartbeats to keep the connection alive
+func (si *ServiceInstance) heartbeatLoop(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-si.stopCh:
+			return
+		case <-ticker.C:
+			if si.stream == nil {
+				continue
+			}
+
+			err := si.stream.Send(&proto.ClientMessage{
+				InstanceId: si.instanceID,
+				Type:       proto.ClientMessage_HEARTBEAT,
+			})
+
+			if err != nil {
+				si.logger.Warn("Failed to send heartbeat", zap.Error(err))
+				// Signal reconnection needed
+				select {
+				case si.reconnectCh <- struct{}{}:
+				default:
+					// Channel already has a pending reconnect
+				}
+			}
+		}
+	}
+}
+
+// reportStatus periodically reports instance status to the distributor
+func (si *ServiceInstance) reportStatus(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-si.stopCh:
+			return
+		case <-ticker.C:
+			if si.stream == nil {
+				continue
+			}
+
+			si.mu.RLock()
+			activeCount := len(si.activeShards)
+			standbyCount := len(si.standbyShards)
+			status := si.status
+			si.mu.RUnlock()
+
+			// Send status report
+			err := si.stream.Send(&proto.ClientMessage{
+				InstanceId: si.instanceID,
+				Type:       proto.ClientMessage_STATUS_REPORT,
+				Status: &proto.StatusReport{
+					InstanceId:        si.instanceID,
+					Status:            status,
+					CpuUsage:          0.5, // Simulated CPU usage
+					MemoryUsage:       0.4, // Simulated memory usage
+					ActiveShardCount:  int32(activeCount),
+					StandbyShardCount: int32(standbyCount),
+					CustomMetrics: map[string]float64{
+						"qps": 100.0, // Simulated QPS
+					},
+				},
+			})
+
+			if err != nil {
+				si.logger.Warn("Failed to send status report", zap.Error(err))
+				// Signal reconnection needed
+				select {
+				case si.reconnectCh <- struct{}{}:
+				default:
+					// Channel already has a pending reconnect
+				}
+			}
 		}
 	}
 }
@@ -197,50 +477,16 @@ func (si *ServiceInstance) recordHandoverCompletion(shardID string) {
 	}
 }
 
-// reportStatus periodically reports instance status to the distributor
-func (si *ServiceInstance) reportStatus(ctx context.Context) {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-si.stopCh:
-			return
-		case <-ticker.C:
-			si.mu.RLock()
-			activeCount := len(si.activeShards)
-			standbyCount := len(si.standbyShards)
-			status := si.status
-			si.mu.RUnlock()
-
-			// Send status report
-			_, err := si.client.ReportStatus(ctx, &proto.StatusReport{
-				InstanceId:        si.instanceID,
-				Status:            status,
-				CpuUsage:          0.5, // Simulated CPU usage
-				MemoryUsage:       0.4, // Simulated memory usage
-				ActiveShardCount:  int32(activeCount),
-				StandbyShardCount: int32(standbyCount),
-				CustomMetrics: map[string]float64{
-					"qps": 100.0, // Simulated QPS
-				},
-			})
-
-			if err != nil {
-				si.logger.Error("Error reporting status", zap.Error(err))
-			}
-		}
-	}
-}
-
 // activateShard activates a shard for processing
-func (si *ServiceInstance) activateShard(shardID string) {
+func (si *ServiceInstance) activateShard(shardID string, version int64) {
 	si.mu.Lock()
 	defer si.mu.Unlock()
 
-	// Skip if already active
-	if _, exists := si.activeShards[shardID]; exists {
-		return
+	// Skip if already active with same or newer version
+	if handler, exists := si.activeShards[shardID]; exists {
+		if handler.version >= version {
+			return
+		}
 	}
 
 	var handler *ShardHandler
@@ -253,6 +499,7 @@ func (si *ServiceInstance) activateShard(shardID string) {
 		handler.isActive = true
 		handler.isStandby = false
 		handler.activatedAt = time.Now()
+		handler.version = version
 		delete(si.standbyShards, shardID)
 		si.logger.Info("Fast activation of shard",
 			zap.String("shard", shardID),
@@ -271,6 +518,7 @@ func (si *ServiceInstance) activateShard(shardID string) {
 			lastUpdated: time.Now(),
 			activatedAt: time.Now(),
 			workItems:   make(map[string]bool),
+			version:     version,
 		}
 		si.logger.Info("Regular activation of shard", zap.String("shard", shardID))
 
@@ -285,15 +533,15 @@ func (si *ServiceInstance) activateShard(shardID string) {
 }
 
 // prepareShard prepares a shard for fast activation
-func (si *ServiceInstance) prepareShard(shardID string) {
+func (si *ServiceInstance) prepareShard(shardID string, version int64) {
 	si.mu.Lock()
 	defer si.mu.Unlock()
 
-	// Skip if already active or standby
+	// Skip if already active or standby with same or newer version
 	if _, exists := si.activeShards[shardID]; exists {
 		return
 	}
-	if _, exists := si.standbyShards[shardID]; exists {
+	if standby, exists := si.standbyShards[shardID]; exists && standby.version >= version {
 		return
 	}
 
@@ -306,6 +554,7 @@ func (si *ServiceInstance) prepareShard(shardID string) {
 		lastUpdated: time.Now(),
 		preparedAt:  time.Now(),
 		workItems:   make(map[string]bool),
+		version:     version,
 	}
 
 	si.standbyShards[shardID] = handler
@@ -448,19 +697,22 @@ func (si *ServiceInstance) Shutdown(ctx context.Context) error {
 	si.logger.Info("Beginning graceful shutdown of instance", zap.String("instance", si.instanceID))
 
 	// Report draining status
-	_, err := si.client.ReportStatus(ctx, &proto.StatusReport{
-		InstanceId:        si.instanceID,
-		Status:            proto.StatusReport_DRAINING,
-		ActiveShardCount:  int32(len(si.activeShards)),
-		StandbyShardCount: int32(len(si.standbyShards)),
-	})
+	if si.stream != nil {
+		err := si.stream.Send(&proto.ClientMessage{
+			InstanceId: si.instanceID,
+			Type:       proto.ClientMessage_STATUS_REPORT,
+			Status: &proto.StatusReport{
+				InstanceId:        si.instanceID,
+				Status:            proto.StatusReport_DRAINING,
+				ActiveShardCount:  int32(len(si.activeShards)),
+				StandbyShardCount: int32(len(si.standbyShards)),
+			},
+		})
 
-	if err != nil {
-		si.logger.Warn("Error reporting draining status", zap.Error(err))
+		if err != nil {
+			si.logger.Warn("Error reporting draining status", zap.Error(err))
+		}
 	}
-
-	// Wait for shards to be reassigned or timeout
-	deadline := time.Now().Add(10 * time.Second)
 
 	// Print transfer latency stats
 	min, max, avg, count := si.GetTransferLatencyStats()
@@ -472,6 +724,8 @@ func (si *ServiceInstance) Shutdown(ctx context.Context) error {
 			zap.Duration("avg_latency", avg))
 	}
 
+	// Wait for shards to be reassigned or timeout
+	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		si.mu.RLock()
 		shardCount := len(si.activeShards)
@@ -485,17 +739,28 @@ func (si *ServiceInstance) Shutdown(ctx context.Context) error {
 		time.Sleep(100 * time.Millisecond)
 	}
 
+	// Send deregistration message
+	if si.stream != nil {
+		err := si.stream.Send(&proto.ClientMessage{
+			InstanceId: si.instanceID,
+			Type:       proto.ClientMessage_DEREGISTER,
+		})
+
+		if err != nil {
+			si.logger.Warn("Error sending deregistration", zap.Error(err))
+		} else {
+			// Wait for deregistration response
+			resp, err := si.stream.Recv()
+			if err == nil && resp.Type == proto.ServerMessage_DEREGISTER_RESPONSE {
+				si.logger.Info("Deregistration response received",
+					zap.Bool("success", resp.Success),
+					zap.String("message", resp.Message))
+			}
+		}
+	}
+
 	// Signal all goroutines to stop
 	close(si.stopCh)
-
-	// Deregister from distributor
-	_, err = si.client.DeregisterInstance(ctx, &proto.InstanceInfo{
-		InstanceId: si.instanceID,
-	})
-
-	if err != nil {
-		si.logger.Error("Error deregistering instance", zap.Error(err))
-	}
 
 	// Close connection
 	if si.conn != nil {

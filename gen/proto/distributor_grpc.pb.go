@@ -19,10 +19,7 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	ShardDistributor_WatchShardAssignments_FullMethodName = "/sharddistributor.ShardDistributor/WatchShardAssignments"
-	ShardDistributor_ReportStatus_FullMethodName          = "/sharddistributor.ShardDistributor/ReportStatus"
-	ShardDistributor_RegisterInstance_FullMethodName      = "/sharddistributor.ShardDistributor/RegisterInstance"
-	ShardDistributor_DeregisterInstance_FullMethodName    = "/sharddistributor.ShardDistributor/DeregisterInstance"
+	ShardDistributor_ShardDistributorStream_FullMethodName = "/sharddistributor.ShardDistributor/ShardDistributorStream"
 )
 
 // ShardDistributorClient is the client API for ShardDistributor service.
@@ -31,14 +28,11 @@ const (
 //
 // ShardDistributor service provides fast shard distribution notifications
 type ShardDistributorClient interface {
-	// WatchShardAssignments opens a stream for the instance to receive shard assignments
-	WatchShardAssignments(ctx context.Context, in *InstanceInfo, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ShardAssignment], error)
-	// ReportStatus allows instances to report their status and metrics
-	ReportStatus(ctx context.Context, in *StatusReport, opts ...grpc.CallOption) (*StatusResponse, error)
-	// RegisterInstance registers a new service instance
-	RegisterInstance(ctx context.Context, in *InstanceInfo, opts ...grpc.CallOption) (*RegisterResponse, error)
-	// DeregisterInstance gracefully deregisters a service instance
-	DeregisterInstance(ctx context.Context, in *InstanceInfo, opts ...grpc.CallOption) (*DeregisterResponse, error)
+	// ShardDistributorStream provides a bidirectional stream for all communications:
+	// - Instance registration and deregistration
+	// - Shard assignment watching and heartbeats
+	// - Status updates
+	ShardDistributorStream(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[ClientMessage, ServerMessage], error)
 }
 
 type shardDistributorClient struct {
@@ -49,54 +43,18 @@ func NewShardDistributorClient(cc grpc.ClientConnInterface) ShardDistributorClie
 	return &shardDistributorClient{cc}
 }
 
-func (c *shardDistributorClient) WatchShardAssignments(ctx context.Context, in *InstanceInfo, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ShardAssignment], error) {
+func (c *shardDistributorClient) ShardDistributorStream(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[ClientMessage, ServerMessage], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &ShardDistributor_ServiceDesc.Streams[0], ShardDistributor_WatchShardAssignments_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &ShardDistributor_ServiceDesc.Streams[0], ShardDistributor_ShardDistributorStream_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
-	x := &grpc.GenericClientStream[InstanceInfo, ShardAssignment]{ClientStream: stream}
-	if err := x.ClientStream.SendMsg(in); err != nil {
-		return nil, err
-	}
-	if err := x.ClientStream.CloseSend(); err != nil {
-		return nil, err
-	}
+	x := &grpc.GenericClientStream[ClientMessage, ServerMessage]{ClientStream: stream}
 	return x, nil
 }
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type ShardDistributor_WatchShardAssignmentsClient = grpc.ServerStreamingClient[ShardAssignment]
-
-func (c *shardDistributorClient) ReportStatus(ctx context.Context, in *StatusReport, opts ...grpc.CallOption) (*StatusResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(StatusResponse)
-	err := c.cc.Invoke(ctx, ShardDistributor_ReportStatus_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (c *shardDistributorClient) RegisterInstance(ctx context.Context, in *InstanceInfo, opts ...grpc.CallOption) (*RegisterResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(RegisterResponse)
-	err := c.cc.Invoke(ctx, ShardDistributor_RegisterInstance_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (c *shardDistributorClient) DeregisterInstance(ctx context.Context, in *InstanceInfo, opts ...grpc.CallOption) (*DeregisterResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(DeregisterResponse)
-	err := c.cc.Invoke(ctx, ShardDistributor_DeregisterInstance_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
+type ShardDistributor_ShardDistributorStreamClient = grpc.BidiStreamingClient[ClientMessage, ServerMessage]
 
 // ShardDistributorServer is the server API for ShardDistributor service.
 // All implementations must embed UnimplementedShardDistributorServer
@@ -104,14 +62,11 @@ func (c *shardDistributorClient) DeregisterInstance(ctx context.Context, in *Ins
 //
 // ShardDistributor service provides fast shard distribution notifications
 type ShardDistributorServer interface {
-	// WatchShardAssignments opens a stream for the instance to receive shard assignments
-	WatchShardAssignments(*InstanceInfo, grpc.ServerStreamingServer[ShardAssignment]) error
-	// ReportStatus allows instances to report their status and metrics
-	ReportStatus(context.Context, *StatusReport) (*StatusResponse, error)
-	// RegisterInstance registers a new service instance
-	RegisterInstance(context.Context, *InstanceInfo) (*RegisterResponse, error)
-	// DeregisterInstance gracefully deregisters a service instance
-	DeregisterInstance(context.Context, *InstanceInfo) (*DeregisterResponse, error)
+	// ShardDistributorStream provides a bidirectional stream for all communications:
+	// - Instance registration and deregistration
+	// - Shard assignment watching and heartbeats
+	// - Status updates
+	ShardDistributorStream(grpc.BidiStreamingServer[ClientMessage, ServerMessage]) error
 	mustEmbedUnimplementedShardDistributorServer()
 }
 
@@ -122,17 +77,8 @@ type ShardDistributorServer interface {
 // pointer dereference when methods are called.
 type UnimplementedShardDistributorServer struct{}
 
-func (UnimplementedShardDistributorServer) WatchShardAssignments(*InstanceInfo, grpc.ServerStreamingServer[ShardAssignment]) error {
-	return status.Errorf(codes.Unimplemented, "method WatchShardAssignments not implemented")
-}
-func (UnimplementedShardDistributorServer) ReportStatus(context.Context, *StatusReport) (*StatusResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method ReportStatus not implemented")
-}
-func (UnimplementedShardDistributorServer) RegisterInstance(context.Context, *InstanceInfo) (*RegisterResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method RegisterInstance not implemented")
-}
-func (UnimplementedShardDistributorServer) DeregisterInstance(context.Context, *InstanceInfo) (*DeregisterResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method DeregisterInstance not implemented")
+func (UnimplementedShardDistributorServer) ShardDistributorStream(grpc.BidiStreamingServer[ClientMessage, ServerMessage]) error {
+	return status.Errorf(codes.Unimplemented, "method ShardDistributorStream not implemented")
 }
 func (UnimplementedShardDistributorServer) mustEmbedUnimplementedShardDistributorServer() {}
 func (UnimplementedShardDistributorServer) testEmbeddedByValue()                          {}
@@ -155,70 +101,12 @@ func RegisterShardDistributorServer(s grpc.ServiceRegistrar, srv ShardDistributo
 	s.RegisterService(&ShardDistributor_ServiceDesc, srv)
 }
 
-func _ShardDistributor_WatchShardAssignments_Handler(srv interface{}, stream grpc.ServerStream) error {
-	m := new(InstanceInfo)
-	if err := stream.RecvMsg(m); err != nil {
-		return err
-	}
-	return srv.(ShardDistributorServer).WatchShardAssignments(m, &grpc.GenericServerStream[InstanceInfo, ShardAssignment]{ServerStream: stream})
+func _ShardDistributor_ShardDistributorStream_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(ShardDistributorServer).ShardDistributorStream(&grpc.GenericServerStream[ClientMessage, ServerMessage]{ServerStream: stream})
 }
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type ShardDistributor_WatchShardAssignmentsServer = grpc.ServerStreamingServer[ShardAssignment]
-
-func _ShardDistributor_ReportStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(StatusReport)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(ShardDistributorServer).ReportStatus(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: ShardDistributor_ReportStatus_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(ShardDistributorServer).ReportStatus(ctx, req.(*StatusReport))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-func _ShardDistributor_RegisterInstance_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(InstanceInfo)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(ShardDistributorServer).RegisterInstance(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: ShardDistributor_RegisterInstance_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(ShardDistributorServer).RegisterInstance(ctx, req.(*InstanceInfo))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-func _ShardDistributor_DeregisterInstance_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(InstanceInfo)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(ShardDistributorServer).DeregisterInstance(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: ShardDistributor_DeregisterInstance_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(ShardDistributorServer).DeregisterInstance(ctx, req.(*InstanceInfo))
-	}
-	return interceptor(ctx, in, info, handler)
-}
+type ShardDistributor_ShardDistributorStreamServer = grpc.BidiStreamingServer[ClientMessage, ServerMessage]
 
 // ShardDistributor_ServiceDesc is the grpc.ServiceDesc for ShardDistributor service.
 // It's only intended for direct use with grpc.RegisterService,
@@ -226,25 +114,13 @@ func _ShardDistributor_DeregisterInstance_Handler(srv interface{}, ctx context.C
 var ShardDistributor_ServiceDesc = grpc.ServiceDesc{
 	ServiceName: "sharddistributor.ShardDistributor",
 	HandlerType: (*ShardDistributorServer)(nil),
-	Methods: []grpc.MethodDesc{
-		{
-			MethodName: "ReportStatus",
-			Handler:    _ShardDistributor_ReportStatus_Handler,
-		},
-		{
-			MethodName: "RegisterInstance",
-			Handler:    _ShardDistributor_RegisterInstance_Handler,
-		},
-		{
-			MethodName: "DeregisterInstance",
-			Handler:    _ShardDistributor_DeregisterInstance_Handler,
-		},
-	},
+	Methods:     []grpc.MethodDesc{},
 	Streams: []grpc.StreamDesc{
 		{
-			StreamName:    "WatchShardAssignments",
-			Handler:       _ShardDistributor_WatchShardAssignments_Handler,
+			StreamName:    "ShardDistributorStream",
+			Handler:       _ShardDistributor_ShardDistributorStream_Handler,
 			ServerStreams: true,
+			ClientStreams: true,
 		},
 	},
 	Metadata: "distributor.proto",
