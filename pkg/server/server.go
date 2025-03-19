@@ -29,6 +29,7 @@ type ShardDistributorServer struct {
 	leaderChan       chan bool
 	session          *concurrency.Session
 	logger           *zap.Logger
+	stopChan         chan struct{}
 }
 
 // InstanceData contains information about a service instance
@@ -40,8 +41,8 @@ type InstanceData struct {
 
 // NewShardDistributorServer creates a new shard distributor server
 func NewShardDistributorServer(logger *zap.Logger, etcdClient *clientv3.Client) (*ShardDistributorServer, error) {
-	// Create a session for leader election
-	session, err := concurrency.NewSession(etcdClient, concurrency.WithTTL(5))
+	// Create a session for leader election with longer TTL for stability
+	session, err := concurrency.NewSession(etcdClient, concurrency.WithTTL(15))
 	if err != nil {
 		return nil, fmt.Errorf("create etcd session: %w", err)
 	}
@@ -59,6 +60,7 @@ func NewShardDistributorServer(logger *zap.Logger, etcdClient *clientv3.Client) 
 		leaderChan:       make(chan bool, 1),
 		session:          session,
 		logger:           logger,
+		stopChan:         make(chan struct{}),
 	}
 
 	// Start leadership campaign
@@ -281,36 +283,81 @@ func (s *ShardDistributorServer) WatchShardAssignments(
 
 // campaignForLeadership tries to become the leader for shard distribution
 func (s *ShardDistributorServer) campaignForLeadership() {
+	backoff := 1 * time.Second
+	maxBackoff := 10 * time.Second
+
 	for {
-		// Try to become leader
-		err := s.election.Campaign(context.Background(), "candidate")
-		if err != nil {
-			s.logger.Warn("Failed to campaign for leadership", zap.Error(err))
-			time.Sleep(time.Second)
-			continue
+		select {
+		case <-s.stopChan:
+			return
+		default:
+			// Try to become leader
+			s.logger.Debug("Campaigning for leadership")
+
+			err := s.election.Campaign(context.Background(), "candidate")
+			if err != nil {
+				s.logger.Warn("Failed to campaign for leadership", zap.Error(err))
+				// Use exponential backoff for retry
+				time.Sleep(backoff)
+				backoff = min(backoff*2, maxBackoff)
+				continue
+			}
+
+			// Reset backoff on success
+			backoff = 1 * time.Second
+
+			// Get our leader key to identify our own leadership
+			leaderResp, err := s.election.Leader(context.Background())
+			if err != nil {
+				s.logger.Warn("Failed to get leader key", zap.Error(err))
+				time.Sleep(time.Second)
+				continue
+			}
+			myLeaderKey := string(leaderResp.Kvs[0].Key)
+
+			// Successfully became leader
+			s.mu.Lock()
+			s.isLeader = true
+			s.mu.Unlock()
+
+			s.logger.Info("Became leader for shard distribution")
+
+			// Recalculate distribution
+			s.recalculateShardDistribution()
+
+			// Watch for leadership changes
+			watchCh := s.election.Observe(context.Background())
+			leaderChanged := false
+			for !leaderChanged {
+				select {
+				case <-s.stopChan:
+					return
+				case resp, ok := <-watchCh:
+					if !ok {
+						s.logger.Info("Watcher closed")
+						leaderChanged = true
+					}
+
+					// Check if we're still the leader by comparing keys
+					currentLeaderKey := string(resp.Kvs[0].Key)
+					if currentLeaderKey != myLeaderKey {
+						s.logger.Info("Leadership transferred to another instance",
+							zap.String("current_key", currentLeaderKey),
+							zap.String("my_key", myLeaderKey))
+						leaderChanged = true
+					}
+				}
+			}
+
+			s.logger.Info("No longer leader for shard distribution")
+
+			s.mu.Lock()
+			s.isLeader = false
+			s.mu.Unlock()
+
+			// Wait before trying again to avoid rapid oscillation
+			time.Sleep(3 * time.Second)
 		}
-
-		// Successfully became leader
-		s.mu.Lock()
-		s.isLeader = true
-		s.mu.Unlock()
-
-		s.logger.Info("Became leader for shard distribution")
-
-		// Recalculate distribution
-		s.recalculateShardDistribution()
-
-		// Watch for leadership changes
-		ch := s.election.Observe(context.Background())
-
-		// Block until leadership changes
-		<-ch
-
-		s.logger.Info("Leadership changed, no longer leader")
-
-		s.mu.Lock()
-		s.isLeader = false
-		s.mu.Unlock()
 	}
 }
 
@@ -457,37 +504,42 @@ func (s *ShardDistributorServer) checkInstanceHealth() {
 	ticker := time.NewTicker(time.Second * 5)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		s.mu.Lock()
-		now := time.Now()
-		unhealthy := 0
+	for {
+		select {
+		case <-s.stopChan:
+			return
+		case <-ticker.C:
+			s.mu.Lock()
+			now := time.Now()
+			unhealthy := 0
 
-		// Check for instances that haven't sent a heartbeat recently
-		for id, instance := range s.instances {
-			if now.Sub(instance.LastHeartbeat) > time.Second*15 {
-				// Remove from our instances map
-				delete(s.instances, id)
-				unhealthy++
+			// Check for instances that haven't sent a heartbeat recently
+			for id, instance := range s.instances {
+				if now.Sub(instance.LastHeartbeat) > time.Second*15 {
+					// Remove from our instances map
+					delete(s.instances, id)
+					unhealthy++
 
-				// Remove from etcd
-				key := fmt.Sprintf("/services/%s", id)
-				_, err := s.etcdClient.Delete(context.Background(), key)
-				if err != nil {
-					s.logger.Warn("Error removing unhealthy instance from etcd", zap.Error(err))
+					// Remove from etcd
+					key := fmt.Sprintf("/services/%s", id)
+					_, err := s.etcdClient.Delete(context.Background(), key)
+					if err != nil {
+						s.logger.Warn("Error removing unhealthy instance from etcd", zap.Error(err))
+					}
+
+					// Close streams
+					delete(s.instanceStreams, id)
 				}
-
-				// Close streams
-				delete(s.instanceStreams, id)
 			}
-		}
 
-		needsRecalculation := unhealthy > 0 && s.isLeader
-		s.mu.Unlock()
+			needsRecalculation := unhealthy > 0 && s.isLeader
+			s.mu.Unlock()
 
-		// Recalculate if we found unhealthy instances and we're the leader
-		if needsRecalculation {
-			s.logger.Info("Recalculating distribution", zap.Int("unhealth_instances", unhealthy))
-			s.recalculateShardDistribution()
+			// Recalculate if we found unhealthy instances and we're the leader
+			if needsRecalculation {
+				s.logger.Info("Recalculating distribution", zap.Int("unhealth_instances", unhealthy))
+				s.recalculateShardDistribution()
+			}
 		}
 	}
 }
@@ -535,4 +587,9 @@ func (s *ShardDistributorServer) LoadShardDefinitions(ctx context.Context, numSh
 	}
 
 	return nil
+}
+
+// Shutdown gracefully stops the server
+func (s *ShardDistributorServer) Shutdown() {
+	close(s.stopChan)
 }

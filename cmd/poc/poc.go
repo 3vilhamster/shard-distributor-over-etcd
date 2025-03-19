@@ -21,7 +21,7 @@ import (
 )
 
 var (
-	mode        = flag.String("mode", "", "Mode: 'server' or 'client'")
+	mode        = flag.String("mode", "", "Mode: 'server', 'client' or 'healthcheck'")
 	etcdAddr    = flag.String("etcd", "localhost:2379", "etcd server address")
 	serverAddr  = flag.String("server", "localhost:50051", "Server address")
 	instanceID  = flag.String("id", "", "Instance ID (required for client mode)")
@@ -43,6 +43,39 @@ func main() {
 		logger.Fatal("Please specify mode: -mode=server or -mode=client")
 	}
 
+	// Set up signal handling for graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		logger.Info("Received shutdown signal")
+		cancel()
+	}()
+
+	switch *mode {
+	case "server":
+		runServer(ctx, logger)
+	case "client":
+		runClient(ctx, logger)
+	case "healthcheck":
+		conn, err := net.DialTimeout("tcp", *serverAddr, time.Second*2)
+		if err != nil {
+			fmt.Println("Health check failed:", err)
+			os.Exit(1)
+		}
+		err = conn.Close()
+		if err != nil {
+			return
+		}
+		fmt.Println("Health check passed")
+		os.Exit(0)
+	}
+}
+
+func runServer(ctx context.Context, logger *zap.Logger) {
+	logger.Info("Starting shard distributor server...")
+
 	// Create etcd client
 	etcdClient, err := clientv3.New(clientv3.Config{
 		Endpoints:   []string{*etcdAddr},
@@ -58,35 +91,15 @@ func main() {
 		}
 	}(etcdClient)
 
-	// Set up signal handling for graceful shutdown
-	ctx, cancel := context.WithCancel(context.Background())
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-sigCh
-		log.Println("Received shutdown signal")
-		cancel()
-	}()
-
-	if *mode == "server" {
-		runServer(ctx, logger, etcdClient)
-	} else if *mode == "client" {
-		runClient(ctx, logger)
-	}
-}
-
-func runServer(ctx context.Context, logger *zap.Logger, etcdClient *clientv3.Client) {
-	log.Println("Starting shard distributor server...")
-
 	// Create the shard distributor server
 	s, err := server.NewShardDistributorServer(logger, etcdClient)
 	if err != nil {
-		log.Fatalf("Failed to create server: %v", err)
+		logger.Fatal("Failed to create server", zap.Error(err))
 	}
 
 	// Initialize shards
 	if err := s.LoadShardDefinitions(ctx, *numShards); err != nil {
-		log.Fatalf("Failed to initialize shards: %v", err)
+		logger.Fatal("Failed to initialize shards", zap.Error(err))
 	}
 
 	// Create gRPC server
@@ -96,21 +109,21 @@ func runServer(ctx context.Context, logger *zap.Logger, etcdClient *clientv3.Cli
 	// Start listening
 	lis, err := net.Listen("tcp", *serverAddr)
 	if err != nil {
-		log.Fatalf("Failed to listen: %v", err)
+		logger.Fatal("Failed to listen", zap.Error(err))
 	}
 
 	// Start server in a goroutine
 	go func() {
-		log.Printf("Server listening on %s", *serverAddr)
+		logger.Info("Server listening", zap.String("port", *serverAddr))
 		if err := grpcServer.Serve(lis); err != nil {
-			log.Fatalf("Failed to serve: %v", err)
+			logger.Fatal("Failed to serve", zap.Error(err))
 		}
 	}()
 
 	// Wait for shutdown signal
 	<-ctx.Done()
 	grpcServer.GracefulStop()
-	log.Println("Server shut down")
+	logger.Info("Server shut down")
 }
 
 func runClient(ctx context.Context, logger *zap.Logger) {
@@ -125,17 +138,17 @@ func runClient(ctx context.Context, logger *zap.Logger) {
 		}
 
 		endpoint := fmt.Sprintf("localhost:%d", 60000+i)
-		log.Printf("Starting service instance %s at %s", id, endpoint)
+		logger.Info("Starting service instance", zap.String("instance", id), zap.String("endpoint", endpoint))
 
 		// Create the service instance
 		instance, err := client.NewServiceInstance(id, endpoint, *serverAddr, logger)
 		if err != nil {
-			log.Fatalf("Failed to create service instance %s: %v", id, err)
+			logger.Fatal("Failed to create service", zap.String("instance", id), zap.Error(err))
 		}
 
 		// Start the instance
 		if err := instance.Start(ctx); err != nil {
-			log.Fatalf("Failed to start service instance %s: %v", id, err)
+			logger.Fatal("Failed to start service instance", zap.String("instance", id), zap.Error(err))
 		}
 
 		instances = append(instances, instance)
@@ -146,8 +159,12 @@ func runClient(ctx context.Context, logger *zap.Logger) {
 		go func() {
 			// Wait a bit before killing the first instance
 			time.Sleep(20 * time.Second)
-			log.Printf("Simulating failure of instance %s", instances[0].InstanceID())
-			instances[0].Shutdown(context.Background())
+			logger.Info("Simulating failure of instance %s", zap.String("instance", instances[0].InstanceID()))
+			err := instances[0].Shutdown(context.Background())
+			if err != nil {
+				logger.Warn("Failed to shut down instance %s", zap.String("instance", instances[0].InstanceID()))
+				return
+			}
 			instances = instances[1:]
 		}()
 	}
@@ -160,11 +177,15 @@ func runClient(ctx context.Context, logger *zap.Logger) {
 	case <-ctx.Done():
 		// External shutdown signal
 	case <-timer.C:
-		log.Printf("Test duration of %s completed", *runDuration)
+		logger.Info("Test duration of completed", zap.Duration("duration", *runDuration))
 	}
 
 	// Shutdown all instances gracefully
 	for _, instance := range instances {
-		instance.Shutdown(context.Background())
+		err := instance.Shutdown(context.Background())
+		if err != nil {
+			logger.Warn("Failed to shut down instance %s", zap.String("instance", instances[0].InstanceID()))
+			return
+		}
 	}
 }

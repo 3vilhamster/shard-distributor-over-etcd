@@ -28,7 +28,7 @@ services:
       - "50051:50051"
     command: ["-mode=server", "-etcd=etcd:2379", "-shards=20"]
     healthcheck:
-      test: ["CMD", "nc", "-z", "localhost", "50051"]
+      test: ["CMD", "shard-distributor", "-mode=healthcheck", "-server=localhost:50051"]
       interval: 5s
       timeout: 5s
       retries: 10
