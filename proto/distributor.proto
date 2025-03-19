@@ -22,9 +22,8 @@ service ShardDistributor {
 // InstanceInfo contains information about a service instance
 message InstanceInfo {
   string instance_id = 1;
-  string endpoint = 2;
-  int32 capacity = 3;
-  map<string, string> metadata = 4;
+  int32 capacity = 2;
+  map<string, string> metadata = 3;
 }
 
 // ShardAssignment represents a shard being assigned or revoked

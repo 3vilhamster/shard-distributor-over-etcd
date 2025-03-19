@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"flag"
-	"fmt"
 	"log"
 	"net"
 	"os"
@@ -26,7 +25,6 @@ var (
 	serverAddr  = flag.String("server", "localhost:50051", "Server address")
 	instanceID  = flag.String("id", "", "Instance ID (required for client mode)")
 	numShards   = flag.Int("shards", 10, "Number of shards (server mode only)")
-	numClients  = flag.Int("clients", 3, "Number of client instances to start (client mode only)")
 	runDuration = flag.Duration("duration", 60*time.Second, "Duration to run the test")
 	failover    = flag.Bool("failover", false, "Simulate instance failure (client mode only)")
 )
@@ -59,22 +57,27 @@ func main() {
 	case "client":
 		runClient(ctx, logger)
 	case "healthcheck":
+		// Make sure to print detailed diagnostics information
+		logger.Info("Starting health check", zap.String("server_addr", *serverAddr))
+
+		// Set a reasonable timeout
 		conn, err := net.DialTimeout("tcp", *serverAddr, time.Second*2)
 		if err != nil {
-			fmt.Println("Health check failed:", err)
+			logger.Error("Health check failed", zap.Error(err))
 			os.Exit(1)
 		}
 		err = conn.Close()
 		if err != nil {
+			logger.Error("Error closing connection", zap.Error(err))
 			return
 		}
-		fmt.Println("Health check passed")
+		logger.Info("Health check passed")
 		os.Exit(0)
 	}
 }
 
 func runServer(ctx context.Context, logger *zap.Logger) {
-	logger.Info("Starting shard distributor server...")
+	logger.Info("Starting shard distributor server...", zap.String("addr", *serverAddr))
 
 	// Create etcd client
 	etcdClient, err := clientv3.New(clientv3.Config{
@@ -109,12 +112,12 @@ func runServer(ctx context.Context, logger *zap.Logger) {
 	// Start listening
 	lis, err := net.Listen("tcp", *serverAddr)
 	if err != nil {
-		logger.Fatal("Failed to listen", zap.Error(err))
+		logger.Fatal("Failed to listen", zap.Error(err), zap.String("addr", *serverAddr))
 	}
 
 	// Start server in a goroutine
 	go func() {
-		logger.Info("Server listening", zap.String("port", *serverAddr))
+		logger.Info("Server listening", zap.String("addr", *serverAddr))
 		if err := grpcServer.Serve(lis); err != nil {
 			logger.Fatal("Failed to serve", zap.Error(err))
 		}
@@ -127,46 +130,22 @@ func runServer(ctx context.Context, logger *zap.Logger) {
 }
 
 func runClient(ctx context.Context, logger *zap.Logger) {
-	var instances []*client.ServiceInstance
-	baseID := *instanceID
-
-	// Start multiple instances if requested
-	for i := 0; i < *numClients; i++ {
-		id := baseID
-		if *numClients > 1 {
-			id = fmt.Sprintf("%s-%d", baseID, i)
-		}
-
-		endpoint := fmt.Sprintf("localhost:%d", 60000+i)
-		logger.Info("Starting service instance", zap.String("instance", id), zap.String("endpoint", endpoint))
-
-		// Create the service instance
-		instance, err := client.NewServiceInstance(id, endpoint, *serverAddr, logger)
-		if err != nil {
-			logger.Fatal("Failed to create service", zap.String("instance", id), zap.Error(err))
-		}
-
-		// Start the instance
-		if err := instance.Start(ctx); err != nil {
-			logger.Fatal("Failed to start service instance", zap.String("instance", id), zap.Error(err))
-		}
-
-		instances = append(instances, instance)
+	if *instanceID == "" {
+		logger.Fatal("Instance ID is required in client mode")
 	}
 
-	// Simulate instance failure if requested
-	if *failover && len(instances) > 1 {
-		go func() {
-			// Wait a bit before killing the first instance
-			time.Sleep(20 * time.Second)
-			logger.Info("Simulating failure of instance %s", zap.String("instance", instances[0].InstanceID()))
-			err := instances[0].Shutdown(context.Background())
-			if err != nil {
-				logger.Warn("Failed to shut down instance %s", zap.String("instance", instances[0].InstanceID()))
-				return
-			}
-			instances = instances[1:]
-		}()
+	logger.Info("Starting service instance",
+		zap.String("instance", *instanceID))
+
+	// Create the service instance
+	instance, err := client.NewServiceInstance(*instanceID, *serverAddr, logger)
+	if err != nil {
+		logger.Fatal("Failed to create service", zap.Error(err))
+	}
+
+	// Start the instance
+	if err := instance.Start(ctx); err != nil {
+		logger.Fatal("Failed to start service instance", zap.Error(err))
 	}
 
 	// Create a timer for the test duration
@@ -177,15 +156,12 @@ func runClient(ctx context.Context, logger *zap.Logger) {
 	case <-ctx.Done():
 		// External shutdown signal
 	case <-timer.C:
-		logger.Info("Test duration of completed", zap.Duration("duration", *runDuration))
+		logger.Info("Test duration completed", zap.Duration("duration", *runDuration))
 	}
 
-	// Shutdown all instances gracefully
-	for _, instance := range instances {
-		err := instance.Shutdown(context.Background())
-		if err != nil {
-			logger.Warn("Failed to shut down instance %s", zap.String("instance", instances[0].InstanceID()))
-			return
-		}
+	// Shutdown instance gracefully
+	err = instance.Shutdown(context.Background())
+	if err != nil {
+		logger.Warn("Failed to shut down instance", zap.Error(err))
 	}
 }

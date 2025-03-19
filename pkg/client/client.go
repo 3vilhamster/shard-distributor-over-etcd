@@ -17,7 +17,6 @@ import (
 type ServiceInstance struct {
 	mu              sync.RWMutex
 	instanceID      string
-	endpoint        string
 	distributorAddr string
 	client          proto.ShardDistributorClient
 	conn            *grpc.ClientConn
@@ -26,23 +25,33 @@ type ServiceInstance struct {
 	status          proto.StatusReport_Status
 	isShuttingDown  bool
 	stopCh          chan struct{}
+	handoverTimings map[string]time.Time // Track handover timings
+
+	// Metrics for graceful transfer
+	transferLatencies []time.Duration
 
 	logger *zap.Logger
 }
 
 // ShardHandler manages processing for a single shard
 type ShardHandler struct {
-	shardID     string
-	isActive    bool
-	isStandby   bool
-	dataStore   map[string]interface{}
-	lastUpdated time.Time
+	shardID      string
+	isActive     bool
+	isStandby    bool
+	dataStore    map[string]interface{}
+	lastUpdated  time.Time
+	preparedAt   time.Time       // When this shard was prepared in standby mode
+	activatedAt  time.Time       // When this shard was activated
+	workItems    map[string]bool // Simulate work items in progress
+	processingMu sync.Mutex      // Mutex for work items
 }
 
 // NewServiceInstance creates a new service instance
-func NewServiceInstance(instanceID, endpoint, distributorAddr string, logger *zap.Logger) (*ServiceInstance, error) {
+func NewServiceInstance(instanceID, distributorAddr string, logger *zap.Logger) (*ServiceInstance, error) {
 	// Create a connection to the distributor
-	conn, err := grpc.NewClient(distributorAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(
+		distributorAddr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to distributor: %v", err)
 	}
@@ -50,16 +59,17 @@ func NewServiceInstance(instanceID, endpoint, distributorAddr string, logger *za
 	client := proto.NewShardDistributorClient(conn)
 
 	instance := &ServiceInstance{
-		instanceID:      instanceID,
-		endpoint:        endpoint,
-		distributorAddr: distributorAddr,
-		client:          client,
-		conn:            conn,
-		activeShards:    make(map[string]*ShardHandler),
-		standbyShards:   make(map[string]*ShardHandler),
-		status:          proto.StatusReport_ACTIVE,
-		stopCh:          make(chan struct{}),
-		logger:          logger,
+		instanceID:        instanceID,
+		distributorAddr:   distributorAddr,
+		client:            client,
+		conn:              conn,
+		activeShards:      make(map[string]*ShardHandler),
+		standbyShards:     make(map[string]*ShardHandler),
+		status:            proto.StatusReport_ACTIVE,
+		stopCh:            make(chan struct{}),
+		handoverTimings:   make(map[string]time.Time),
+		transferLatencies: make([]time.Duration, 0),
+		logger:            logger,
 	}
 
 	return instance, nil
@@ -74,7 +84,6 @@ func (si *ServiceInstance) Start(ctx context.Context) error {
 	// Register with the distributor
 	resp, err := si.client.RegisterInstance(ctx, &proto.InstanceInfo{
 		InstanceId: si.instanceID,
-		Endpoint:   si.endpoint,
 		Capacity:   100,
 		Metadata: map[string]string{
 			"region": "us-west",
@@ -116,7 +125,6 @@ func (si *ServiceInstance) watchShardAssignments(ctx context.Context) {
 			// Create watch stream
 			stream, err := si.client.WatchShardAssignments(ctx, &proto.InstanceInfo{
 				InstanceId: si.instanceID,
-				Endpoint:   si.endpoint,
 			})
 
 			if err != nil {
@@ -143,10 +151,16 @@ func (si *ServiceInstance) watchShardAssignments(ctx context.Context) {
 
 				// Process the assignment
 				si.logger.Info("Received shard assignment",
-					zap.String("shard", assignment.ShardId), zap.Stringer("action", assignment.Action))
+					zap.String("shard", assignment.ShardId),
+					zap.Stringer("action", assignment.Action),
+					zap.String("source", assignment.SourceInstanceId))
 
 				switch assignment.Action {
 				case proto.ShardAssignment_ASSIGN:
+					// When assignment includes source instance, it's part of a handover
+					if assignment.SourceInstanceId != "" {
+						si.recordHandoverStart(assignment.ShardId)
+					}
 					si.activateShard(assignment.ShardId)
 				case proto.ShardAssignment_PREPARE:
 					si.prepareShard(assignment.ShardId)
@@ -158,6 +172,28 @@ func (si *ServiceInstance) watchShardAssignments(ctx context.Context) {
 			// If we get here, the stream was broken - try to reconnect after a delay
 			time.Sleep(time.Second)
 		}
+	}
+}
+
+// recordHandoverStart records the start time of a handover
+func (si *ServiceInstance) recordHandoverStart(shardID string) {
+	si.mu.Lock()
+	defer si.mu.Unlock()
+	si.handoverTimings[shardID] = time.Now()
+}
+
+// recordHandoverCompletion calculates and records the handover latency
+func (si *ServiceInstance) recordHandoverCompletion(shardID string) {
+	si.mu.Lock()
+	defer si.mu.Unlock()
+
+	if startTime, exists := si.handoverTimings[shardID]; exists {
+		latency := time.Since(startTime)
+		si.transferLatencies = append(si.transferLatencies, latency)
+		si.logger.Info("Completed shard handover",
+			zap.String("shard", shardID),
+			zap.Duration("latency", latency))
+		delete(si.handoverTimings, shardID)
 	}
 }
 
@@ -216,9 +252,15 @@ func (si *ServiceInstance) activateShard(shardID string) {
 		handler = standby
 		handler.isActive = true
 		handler.isStandby = false
+		handler.activatedAt = time.Now()
 		delete(si.standbyShards, shardID)
 		si.logger.Info("Fast activation of shard",
-			zap.String("shard", shardID), zap.Duration("latency", time.Since(startTime)))
+			zap.String("shard", shardID),
+			zap.Duration("prepare_to_active_latency", time.Since(handler.preparedAt)),
+			zap.Duration("activation_latency", time.Since(startTime)))
+
+		// Record handover completion
+		si.recordHandoverCompletion(shardID)
 	} else {
 		// Create new handler
 		handler = &ShardHandler{
@@ -227,8 +269,10 @@ func (si *ServiceInstance) activateShard(shardID string) {
 			isStandby:   false,
 			dataStore:   make(map[string]interface{}),
 			lastUpdated: time.Now(),
+			activatedAt: time.Now(),
+			workItems:   make(map[string]bool),
 		}
-		si.logger.Info("Regular activation of shard %s", zap.String("shard", shardID))
+		si.logger.Info("Regular activation of shard", zap.String("shard", shardID))
 
 		// Simulate loading initial state
 		time.Sleep(50 * time.Millisecond)
@@ -260,6 +304,8 @@ func (si *ServiceInstance) prepareShard(shardID string) {
 		isStandby:   true,
 		dataStore:   make(map[string]interface{}),
 		lastUpdated: time.Now(),
+		preparedAt:  time.Now(),
+		workItems:   make(map[string]bool),
 	}
 
 	si.standbyShards[shardID] = handler
@@ -315,8 +361,10 @@ func (si *ServiceInstance) deactivateShard(shardID string) {
 
 // processShard simulates processing work for a shard
 func (si *ServiceInstance) processShard(shardID string) {
-	ticker := time.NewTicker(2 * time.Second)
+	ticker := time.NewTicker(500 * time.Millisecond) // Process work more frequently
 	defer ticker.Stop()
+
+	workItemCounter := 0
 
 	for {
 		select {
@@ -332,10 +380,57 @@ func (si *ServiceInstance) processShard(shardID string) {
 				return
 			}
 
-			// Simulate work
-			si.logger.Info("Processing work for shard", zap.String("shard", shardID))
+			// Simulate creating new work items
+			handler.processingMu.Lock()
+			workItemID := fmt.Sprintf("%s-work-%d", shardID, workItemCounter)
+			handler.workItems[workItemID] = true
+			workItemCounter++
+
+			// Simulate completing old work items
+			for itemID := range handler.workItems {
+				// 50% chance to complete a work item
+				if len(handler.workItems) > 5 && workItemCounter%2 == 0 {
+					delete(handler.workItems, itemID)
+					break
+				}
+			}
+
+			inProgressCount := len(handler.workItems)
+			handler.processingMu.Unlock()
+
+			// Log work processing
+			si.logger.Info("Processing work for shard",
+				zap.String("shard", shardID),
+				zap.Int("work_items_in_progress", inProgressCount))
 		}
 	}
+}
+
+// GetTransferLatencyStats returns statistics about shard transfers
+func (si *ServiceInstance) GetTransferLatencyStats() (min, max, avg time.Duration, count int) {
+	si.mu.RLock()
+	defer si.mu.RUnlock()
+
+	if len(si.transferLatencies) == 0 {
+		return 0, 0, 0, 0
+	}
+
+	min = si.transferLatencies[0]
+	max = si.transferLatencies[0]
+	var sum time.Duration
+
+	for _, latency := range si.transferLatencies {
+		if latency < min {
+			min = latency
+		}
+		if latency > max {
+			max = latency
+		}
+		sum += latency
+	}
+
+	avg = sum / time.Duration(len(si.transferLatencies))
+	return min, max, avg, len(si.transferLatencies)
 }
 
 // Shutdown gracefully shuts down the instance
@@ -367,6 +462,16 @@ func (si *ServiceInstance) Shutdown(ctx context.Context) error {
 	// Wait for shards to be reassigned or timeout
 	deadline := time.Now().Add(10 * time.Second)
 
+	// Print transfer latency stats
+	min, max, avg, count := si.GetTransferLatencyStats()
+	if count > 0 {
+		si.logger.Info("Shard transfer statistics",
+			zap.Int("count", count),
+			zap.Duration("min_latency", min),
+			zap.Duration("max_latency", max),
+			zap.Duration("avg_latency", avg))
+	}
+
 	for time.Now().Before(deadline) {
 		si.mu.RLock()
 		shardCount := len(si.activeShards)
@@ -386,7 +491,6 @@ func (si *ServiceInstance) Shutdown(ctx context.Context) error {
 	// Deregister from distributor
 	_, err = si.client.DeregisterInstance(ctx, &proto.InstanceInfo{
 		InstanceId: si.instanceID,
-		Endpoint:   si.endpoint,
 	})
 
 	if err != nil {

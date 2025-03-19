@@ -1,0 +1,20 @@
+services:
+  # Additional client that can be started during the simulation
+  client4:
+    build:
+      context: ..
+    networks:
+      - shard-network
+    command: ["-mode=client", "-id=instance-4", "-server=distributor-server:50051", "-duration=300s"]
+
+  # Replacement client for failed instances
+  client5:
+    build:
+      context: ..
+    networks:
+      - shard-network
+    command: ["-mode=client", "-id=instance-5", "-server=distributor-server:50051", "-duration=300s"]
+
+networks:
+  shard-network:
+    external: true

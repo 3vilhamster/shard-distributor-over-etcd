@@ -10,10 +10,17 @@ import (
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.etcd.io/etcd/client/v3/concurrency"
 	"go.uber.org/zap"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/peer"
+	"google.golang.org/grpc/status"
 
 	"github.com/3vilhamster/shard-distributor-over-etcd/gen/proto"
 	"github.com/3vilhamster/shard-distributor-over-etcd/pkg/sharding"
 )
+
+type Distributor interface {
+	CalculateDistribution(currentMap map[string]string, instances map[string]sharding.InstanceInfo) map[string]string
+}
 
 // ShardDistributorServer implements the ShardDistributor gRPC service
 type ShardDistributorServer struct {
@@ -23,7 +30,7 @@ type ShardDistributorServer struct {
 	instanceStreams  map[string][]proto.ShardDistributor_WatchShardAssignmentsServer
 	instances        map[string]*InstanceData
 	shardAssignments map[string]string // shardID -> instanceID
-	hashStrategy     *sharding.ConsistentHashStrategy
+	hashStrategy     Distributor
 	isLeader         bool
 	election         *concurrency.Election
 	leaderChan       chan bool
@@ -55,7 +62,7 @@ func NewShardDistributorServer(logger *zap.Logger, etcdClient *clientv3.Client) 
 		instanceStreams:  make(map[string][]proto.ShardDistributor_WatchShardAssignmentsServer),
 		instances:        make(map[string]*InstanceData),
 		shardAssignments: make(map[string]string),
-		hashStrategy:     sharding.NewConsistentHashStrategy(100), // 100 virtual nodes
+		hashStrategy:     sharding.NewSimpleHashDistributor(),
 		election:         election,
 		leaderChan:       make(chan bool, 1),
 		session:          session,
@@ -77,10 +84,19 @@ func (s *ShardDistributorServer) RegisterInstance(
 	ctx context.Context,
 	req *proto.InstanceInfo,
 ) (*proto.RegisterResponse, error) {
+	// Extract peer information if available
+	peer, ok := peer.FromContext(ctx)
+	if !ok {
+		return nil, status.Error(codes.Internal, "failed to get peer from context")
+	}
+
+	addr := peer.Addr.String()
+	s.logger.Info("Using peer address as endpoint", zap.String("instance", req.InstanceId), zap.String("peer_addr", addr))
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.logger.Info("Instance registered", zap.String("instance", req.InstanceId), zap.String("endpoint", req.Endpoint))
+	s.logger.Info("Instance registered", zap.String("instance", req.InstanceId), zap.String("endpoint", addr))
 
 	// Store instance information
 	s.instances[req.InstanceId] = &InstanceData{
@@ -99,7 +115,7 @@ func (s *ShardDistributorServer) RegisterInstance(
 	}
 
 	key := fmt.Sprintf("/services/%s", req.InstanceId)
-	_, err = s.etcdClient.Put(ctx, key, req.Endpoint, clientv3.WithLease(lease.ID))
+	_, err = s.etcdClient.Put(ctx, key, addr, clientv3.WithLease(lease.ID))
 	if err != nil {
 		return &proto.RegisterResponse{
 			Success: false,
@@ -376,17 +392,17 @@ func (s *ShardDistributorServer) recalculateShardDistribution() {
 		return
 	}
 
-	// Convert instances to the format needed by the consistent hash strategy
+	// Convert instances to the format needed by the hash strategy
 	activeInstances := make(map[string]sharding.InstanceInfo)
 	for id, instance := range s.instances {
-		// Skip draining instances
+		status := "active"
 		if instance.Status.Status == proto.StatusReport_DRAINING {
-			continue
+			status = "draining"
 		}
 
 		activeInstances[id] = sharding.InstanceInfo{
 			ID:         id,
-			Status:     "active",
+			Status:     status,
 			LoadFactor: instance.Status.CpuUsage,
 			ShardCount: int(instance.Status.ActiveShardCount),
 		}
@@ -414,45 +430,46 @@ func (s *ShardDistributorServer) recalculateShardDistribution() {
 
 	// Identify changes
 	assignmentsToSend := make(map[string][]*proto.ShardAssignment)
+	pendingRevokes := make(map[string][]string) // instanceID -> []shardID
 
-	// First, find shards to revoke
-	for shardID, oldInstanceID := range s.shardAssignments {
-		newInstanceID, exists := newDistribution[shardID]
-		if !exists || newInstanceID != oldInstanceID {
-			// Shard is no longer assigned to the old instance
-			if oldInstanceID != "" {
-				if _, ok := assignmentsToSend[oldInstanceID]; !ok {
-					assignmentsToSend[oldInstanceID] = make([]*proto.ShardAssignment, 0)
-				}
-
-				assignmentsToSend[oldInstanceID] = append(assignmentsToSend[oldInstanceID], &proto.ShardAssignment{
-					ShardId: shardID,
-					Action:  proto.ShardAssignment_REVOKE,
-				})
-			}
-		}
-	}
-
-	// Then, find shards to assign
+	// First, process new assignments
 	for shardID, newInstanceID := range newDistribution {
 		oldInstanceID, exists := s.shardAssignments[shardID]
-		if !exists || oldInstanceID != newInstanceID {
-			// Shard is newly assigned to the new instance
+
+		if exists && oldInstanceID != "" && oldInstanceID != newInstanceID {
+			// This is a transfer - prepare new instance
 			if newInstanceID != "" {
 				if _, ok := assignmentsToSend[newInstanceID]; !ok {
 					assignmentsToSend[newInstanceID] = make([]*proto.ShardAssignment, 0)
 				}
 
-				// First send prepare if it's a transfer
-				if exists && oldInstanceID != "" {
-					assignmentsToSend[newInstanceID] = append(assignmentsToSend[newInstanceID], &proto.ShardAssignment{
-						ShardId:          shardID,
-						Action:           proto.ShardAssignment_PREPARE,
-						SourceInstanceId: oldInstanceID,
-					})
+				// First prepare
+				assignmentsToSend[newInstanceID] = append(assignmentsToSend[newInstanceID], &proto.ShardAssignment{
+					ShardId:          shardID,
+					Action:           proto.ShardAssignment_PREPARE,
+					SourceInstanceId: oldInstanceID,
+				})
+
+				// Then assign
+				assignmentsToSend[newInstanceID] = append(assignmentsToSend[newInstanceID], &proto.ShardAssignment{
+					ShardId:          shardID,
+					Action:           proto.ShardAssignment_ASSIGN,
+					SourceInstanceId: oldInstanceID,
+				})
+			}
+
+			// Mark old instance for revoke
+			if _, ok := pendingRevokes[oldInstanceID]; !ok {
+				pendingRevokes[oldInstanceID] = make([]string, 0)
+			}
+			pendingRevokes[oldInstanceID] = append(pendingRevokes[oldInstanceID], shardID)
+		} else if !exists || oldInstanceID != newInstanceID {
+			// This is a new assignment (not a transfer)
+			if newInstanceID != "" {
+				if _, ok := assignmentsToSend[newInstanceID]; !ok {
+					assignmentsToSend[newInstanceID] = make([]*proto.ShardAssignment, 0)
 				}
 
-				// Then send assign
 				assignmentsToSend[newInstanceID] = append(assignmentsToSend[newInstanceID], &proto.ShardAssignment{
 					ShardId: shardID,
 					Action:  proto.ShardAssignment_ASSIGN,
@@ -464,7 +481,7 @@ func (s *ShardDistributorServer) recalculateShardDistribution() {
 	// Update shard assignments map
 	s.shardAssignments = newDistribution
 
-	// Send notifications through gRPC streams
+	// Send notifications through gRPC streams (PREPAREs and ASSIGNs first)
 	for instanceID, assignments := range assignmentsToSend {
 		streams, exists := s.instanceStreams[instanceID]
 		if !exists || len(streams) == 0 {
@@ -481,6 +498,35 @@ func (s *ShardDistributorServer) recalculateShardDistribution() {
 			}
 		}
 	}
+
+	// Send REVOKEs after a small delay to ensure new instances had time to activate
+	go func(pendingRevokes map[string][]string) {
+		time.Sleep(500 * time.Millisecond)
+
+		s.mu.Lock()
+		defer s.mu.Unlock()
+
+		// Now send all REVOKE messages
+		for instanceID, shardIDs := range pendingRevokes {
+			streams, exists := s.instanceStreams[instanceID]
+			if !exists || len(streams) == 0 {
+				continue
+			}
+
+			for _, shardID := range shardIDs {
+				// Send to all streams for this instance
+				for _, stream := range streams {
+					err := stream.Send(&proto.ShardAssignment{
+						ShardId: shardID,
+						Action:  proto.ShardAssignment_REVOKE,
+					})
+					if err != nil {
+						s.logger.Warn("Error sending revoke", zap.String("instance", instanceID), zap.Error(err))
+					}
+				}
+			}
+		}
+	}(pendingRevokes)
 
 	// Update assignments in etcd
 	batch := s.etcdClient.Txn(context.Background())

@@ -3,6 +3,7 @@ module github.com/3vilhamster/shard-distributor-over-etcd
 go 1.24
 
 require (
+	github.com/dgryski/go-farm v0.0.0-20240924180020-3414d57e47da
 	go.etcd.io/etcd/client/v3 v3.5.9
 	go.uber.org/zap v1.17.0
 	google.golang.org/grpc v1.70.0

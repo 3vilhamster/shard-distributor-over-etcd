@@ -9,60 +9,82 @@ services:
     ports:
       - "2379:2379"
       - "2380:2380"
+    networks:
+      - shard-network
     healthcheck:
       test: ["CMD", "etcdctl", "endpoint", "health"]
       interval: 5s
       timeout: 5s
       retries: 3
 
+  # Distributor server with two instances
   distributor-server:
     build:
       context: .
-    container_name: distributor-server
+    deploy:
+      replicas: 2
     depends_on:
       etcd:
         condition: service_healthy
     environment:
       - ETCD_ENDPOINTS=etcd:2379
-    ports:
-      - "50051:50051"
-    command: ["-mode=server", "-etcd=etcd:2379", "-shards=20"]
+    networks:
+      - shard-network
+    expose:
+      - "50051"
+    command: ["-mode=server", "-etcd=etcd:2379", "-server=0.0.0.0:50051", "-shards=20"]
     healthcheck:
-      test: ["CMD", "shard-distributor", "-mode=healthcheck", "-server=localhost:50051"]
+      test: ["CMD", "/app/shard-distributor", "-mode=healthcheck", "-server=127.0.0.1:50051"]
       interval: 5s
       timeout: 5s
       retries: 10
       start_period: 5s
 
+  # Initial set of client instances
   client1:
     build:
       context: .
-    container_name: client1
     depends_on:
-      distributor-server:
-        condition: service_healthy
-    environment:
-      - SERVER_ADDR=distributor-server:50051
-    command: ["-mode=client", "-id=instance-1", "-server=distributor-server:50051", "-duration=60s"]
+      - distributor-server
+    networks:
+      - shard-network
+    command: ["-mode=client", "-id=instance-1", "-server=distributor-server:50051", "-duration=300s"]
 
   client2:
     build:
       context: .
-    container_name: client2
     depends_on:
-      distributor-server:
-        condition: service_healthy
-    environment:
-      - SERVER_ADDR=distributor-server:50051
-    command: ["-mode=client", "-id=instance-2", "-server=distributor-server:50051", "-duration=60s"]
+      - distributor-server
+    networks:
+      - shard-network
+    command: ["-mode=client", "-id=instance-2", "-server=distributor-server:50051", "-duration=300s"]
 
   client3:
     build:
       context: .
-    container_name: client3
     depends_on:
-      distributor-server:
-        condition: service_healthy
-    environment:
-      - SERVER_ADDR=distributor-server:50051
-    command: ["-mode=client", "-id=instance-3", "-server=distributor-server:50051", "-duration=60s"]
+      - distributor-server
+    networks:
+      - shard-network
+    command: ["-mode=client", "-id=instance-3", "-server=distributor-server:50051", "-duration=300s"]
+
+  # Script to orchestrate graceful transfer simulation
+  simulation-controller:
+    # Use the host's Docker CLI to control containers
+    image: alpine:latest
+    container_name: simulation-controller
+    depends_on:
+      - client1
+      - client2
+      - client3
+    networks:
+      - shard-network
+    volumes:
+      - ./simulation:/simulation
+      - /var/run/docker.sock:/var/run/docker.sock
+    entrypoint: ["/bin/sh", "-c", "apk add --no-cache docker && /simulation/run-simulation.sh"]
+
+
+networks:
+  shard-network:
+    driver: bridge
