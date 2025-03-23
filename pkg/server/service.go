@@ -14,6 +14,8 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	grpcHealth "google.golang.org/grpc/health"
+	healthgrpc "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 
@@ -221,6 +223,7 @@ func (s *Service) Start(ctx context.Context) error {
 	}
 	s.listener = lis
 
+	healthgrpc.RegisterHealthServer(s.grpcServer, grpcHealth.NewServer())
 	proto.RegisterShardDistributorServer(s.grpcServer, s)
 
 	// Start the gRPC server

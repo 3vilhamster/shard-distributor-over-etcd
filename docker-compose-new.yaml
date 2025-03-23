@@ -43,10 +43,10 @@ services:
       - shard-distributor-net
     healthcheck:
       # Use HTTP health endpoint instead of grpc_health_probe
-      test: ["CMD", "/bin/grpc_health_probe", "-addr=:50051"]
-#      interval: 10s
-#      timeout: 5s
-#      retries: 3
+      test: ["CMD", "/app/grpc_health_probe", "-addr=:50051"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
       start_period: 3s
     deploy:
       replicas: 3
@@ -71,10 +71,6 @@ services:
       - shard-distributor-net
     deploy:
       replicas: 2
-      resources:
-        limits:
-          cpus: '0.3'
-          memory: 256M
 
   # Client instances for type2 shards
   client-type2:
@@ -96,10 +92,6 @@ services:
       - shard-distributor-net
     deploy:
       replicas: 2
-      resources:
-        limits:
-          cpus: '0.3'
-          memory: 256M
 
   # Shard generator to create test shards
   shard-generator:
