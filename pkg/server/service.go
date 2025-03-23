@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/http"
-	"strconv"
 	"sync"
 	"time"
 
@@ -41,7 +39,6 @@ type Service struct {
 	grpcServer *grpc.Server
 
 	// Components
-	etcdClient       *clientv3.Client
 	leaderElection   *leader.Election
 	instanceRegistry *registry.Registry
 	shardManager     *shard.Manager
@@ -63,7 +60,6 @@ type ServiceParams struct {
 	Config           config2.Config
 	Logger           *zap.Logger
 	Clock            clockwork.Clock `optional:"true"`
-	GrpcServer       *grpc.Server
 	EtcdClient       *clientv3.Client
 	LeaderElection   *leader.Election
 	InstanceRegistry *registry.Registry
@@ -95,8 +91,7 @@ func NewService(params ServiceParams) (*Service, error) {
 		config:           params.Config,
 		logger:           params.Logger,
 		clock:            clock,
-		grpcServer:       params.GrpcServer,
-		etcdClient:       params.EtcdClient,
+		grpcServer:       grpc.NewServer(),
 		leaderElection:   params.LeaderElection,
 		instanceRegistry: params.InstanceRegistry,
 		shardManager:     params.ShardManager,
@@ -106,9 +101,6 @@ func NewService(params ServiceParams) (*Service, error) {
 		strategyRegistry: strategyRegistry,
 		stopCh:           make(chan struct{}),
 	}
-
-	// Register gRPC service
-	proto.RegisterShardDistributorServer(params.GrpcServer, svc)
 
 	// Wire up callbacks
 	svc.connectComponents()
@@ -123,15 +115,6 @@ func NewService(params ServiceParams) (*Service, error) {
 			return nil
 		},
 	})
-
-	if params.Config.HealthPort > 0 {
-		params.Lifecycle.Append(fx.Hook{
-			OnStart: func(ctx context.Context) error {
-				svc.startHealthProbe(params.Config.HealthPort)
-				return nil
-			},
-		})
-	}
 
 	// Register leader election in lifecycle
 	params.Lifecycle.Append(fx.Hook{
@@ -196,22 +179,32 @@ func (s *Service) connectComponents() {
 
 // Start starts the shard distributor service
 func (s *Service) Start(ctx context.Context) error {
+	s.logger.Info("starting service")
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	s.logger.Info("locked service")
 
 	if s.isRunning {
 		return fmt.Errorf("service already running")
 	}
+
+	s.logger.Info("initializing global version")
 
 	// Initialize the store's global version
 	if err := s.stateStore.InitializeGlobalVersion(ctx); err != nil {
 		return fmt.Errorf("failed to initialize global version: %w", err)
 	}
 
+	s.logger.Info("loading shard definitions")
+
 	// Initialize shards
 	if err := s.shardManager.LoadShardDefinitions(ctx, s.config.ShardCount); err != nil {
 		return fmt.Errorf("failed to initialize shards: %w", err)
 	}
+
+	s.logger.Info("loading shard groups")
 
 	// Load any existing shard groups
 	if err := s.shardManager.LoadShardGroups(ctx); err != nil {
@@ -219,12 +212,16 @@ func (s *Service) Start(ctx context.Context) error {
 		// Continue anyway as this is not fatal
 	}
 
+	s.logger.Info("starting listener for grpc")
+
 	// Start listening
 	lis, err := net.Listen("tcp", s.config.ListenAddr)
 	if err != nil {
 		return fmt.Errorf("failed to listen: %w", err)
 	}
 	s.listener = lis
+
+	proto.RegisterShardDistributorServer(s.grpcServer, s)
 
 	// Start the gRPC server
 	go func() {
@@ -586,29 +583,4 @@ func (s *Service) handleClientStream(
 // GetVersion gets the version for a shard (helper for handleClientStream)
 func (s *Service) GetVersion(shardID string) int64 {
 	return s.shardManager.GetVersion(shardID)
-}
-
-// Add this method to your server's Service struct
-func (s *Service) startHealthProbe(port int) {
-	if port <= 0 {
-		s.logger.Info("HTTP health probe disabled")
-		return
-	}
-
-	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		// Simple health check - return OK if the service is running
-		// For more advanced health checks, you could check etcd connection,
-		// leader status, etc.
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
-	})
-
-	// Start HTTP server in a goroutine
-	go func() {
-		addr := ":" + strconv.Itoa(port)
-		s.logger.Info("Starting HTTP health probe", zap.String("addr", addr))
-		if err := http.ListenAndServe(addr, nil); err != nil {
-			s.logger.Error("HTTP health probe server failed", zap.Error(err))
-		}
-	}()
 }

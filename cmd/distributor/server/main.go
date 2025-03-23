@@ -13,7 +13,6 @@ import (
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/fx"
 	"go.uber.org/zap"
-	"google.golang.org/grpc"
 
 	"github.com/3vilhamster/shard-distributor-over-etcd/pkg/server"
 	"github.com/3vilhamster/shard-distributor-over-etcd/pkg/server/config"
@@ -37,7 +36,6 @@ func main() {
 	leaderElectionPath := flag.String("leader-path", "/shard-distributor/leader", "Leader election path")
 	distributionStrategy := flag.String("strategy", "farmHash", "Distribution strategy (consistentHash, farmHash)")
 	virtualNodes := flag.Int("virtual-nodes", 10, "Virtual nodes for consistent hashing")
-	healthPort := flag.Int("health-port", 8080, "Port for health check")
 	flag.Parse()
 
 	// Create app configuration
@@ -48,7 +46,6 @@ func main() {
 		ShardCount:          *numShards,
 		ReconcileInterval:   *reconcileInterval,
 		HealthCheckInterval: *healthCheckInterval,
-		HealthPort:          *healthPort,
 	}
 
 	fmt.Println("Starting with config:", serverConfig)
@@ -114,21 +111,6 @@ func main() {
 			}
 		}),
 
-		// Provide gRPC server
-		fx.Provide(func(lc fx.Lifecycle, logger *zap.Logger) *grpc.Server {
-			server := grpc.NewServer()
-
-			lc.Append(fx.Hook{
-				OnStop: func(ctx context.Context) error {
-					logger.Info("Stopping gRPC server")
-					server.GracefulStop()
-					return nil
-				},
-			})
-
-			return server
-		}),
-
 		// Provide virtual nodes count with name annotation
 		fx.Provide(
 			fx.Annotate(
@@ -155,6 +137,7 @@ func main() {
 		fx.Provide(health.NewChecker),
 		fx.Provide(reconcile.NewReconciler),
 		fx.Provide(func(store *store.EtcdStore, logger *zap.Logger, registry *registry.Registry) *shard.Manager {
+			logger.Info("store", zap.Any("store", store))
 			return shard.NewManager(shard.ManagerParams{
 				Store:    store,
 				Logger:   logger,
@@ -166,9 +149,10 @@ func main() {
 		fx.Provide(server.NewService),
 
 		// Invoke functions to start the application
-		fx.Invoke(func(logger *zap.Logger, service *server.Service) {
+		fx.Invoke(func(logger *zap.Logger, service *server.Service, etcdStore *store.EtcdStore) {
 			logger.Info("Shard distributor server initialized",
 				zap.String("etcd", *etcdAddr),
+				zap.Any("store", etcdStore),
 				zap.String("server", *serverAddr),
 				zap.Int("shards", *numShards),
 				zap.Duration("reconcile_interval", *reconcileInterval),

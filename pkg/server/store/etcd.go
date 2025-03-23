@@ -37,13 +37,26 @@ type EtcdStoreParams struct {
 }
 
 // NewEtcdStore creates a new etcd store
-func NewEtcdStore(params EtcdStoreParams) *EtcdStore {
+func NewEtcdStore(params EtcdStoreParams) (*EtcdStore, error) {
+	params.Logger.Info("Creating new etcd store")
+
+	// check etcd
+	endpoints := params.Client.Endpoints()
+	for _, endpoint := range endpoints {
+		st, err := params.Client.Status(context.Background(), endpoint)
+		if err != nil {
+			params.Logger.Warn("Failed to connect to etcd", zap.String("endpoint", endpoint), zap.Error(err))
+			return nil, err
+		}
+		params.Logger.Info("etcd status", zap.String("endpoint", endpoint), zap.Any("status", st))
+	}
+
 	return &EtcdStore{
 		client:  params.Client,
 		watcher: params.Client,
 		leaser:  params.Client,
 		logger:  params.Logger,
-	}
+	}, nil
 }
 
 // SaveInstance saves an instance to etcd
@@ -215,8 +228,12 @@ func (s *EtcdStore) IncrementGlobalVersion(ctx context.Context) (int64, error) {
 
 // InitializeGlobalVersion initializes the global version in etcd if it doesn't exist
 func (s *EtcdStore) InitializeGlobalVersion(ctx context.Context) error {
+	s.logger.Info("Attempting to initialize global version")
+
 	// Use a transaction for atomic check-and-set
 	txn := s.client.Txn(ctx)
+
+	s.logger.Info("started tx")
 
 	// If the key doesn't exist
 	txn = txn.If(clientv3.Compare(clientv3.CreateRevision(GlobalVersionKey), "=", 0))
@@ -227,12 +244,16 @@ func (s *EtcdStore) InitializeGlobalVersion(ctx context.Context) error {
 	// Otherwise do nothing
 	txn = txn.Else()
 
+	s.logger.Info("committing")
+
 	// Execute the transaction
 	txnResp, err := txn.Commit()
 	if err != nil {
 		s.logger.Warn("Failed to initialize global version", zap.Error(err))
 		return err
 	}
+
+	s.logger.Info("resp", zap.Any("resp", txnResp))
 
 	if txnResp.Succeeded {
 		s.logger.Info("Initialized global version to 0")
