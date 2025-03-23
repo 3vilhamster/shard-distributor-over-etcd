@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"go.uber.org/fx"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/backoff"
@@ -15,6 +16,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/3vilhamster/shard-distributor-over-etcd/gen/proto/sharddistributor/v1"
+	"github.com/3vilhamster/shard-distributor-over-etcd/pkg/client/config"
 )
 
 const (
@@ -52,17 +54,25 @@ type Manager struct {
 // ServerMessageHandler defines a handler function for server messages
 type ServerMessageHandler func(context.Context, *proto.ShardDistributorStreamResponse) error
 
+type ManagerParams struct {
+	fx.In
+
+	Config       config.ServiceConfig
+	Logger       *zap.Logger
+	InstanceInfo *proto.InstanceInfo
+}
+
 // NewManager creates a new connection manager
-func NewManager(serverAddr, instanceID string, instanceInfo *proto.InstanceInfo) *Manager {
+func NewManager(params ManagerParams) *Manager {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	m := &Manager{
-		serverAddr:        serverAddr,
-		instanceID:        instanceID,
-		instanceInfo:      instanceInfo,
+		serverAddr:        params.Config.ServerAddr,
+		instanceID:        params.Config.InstanceID,
+		instanceInfo:      params.InstanceInfo,
 		heartbeatInterval: DefaultHeartbeatInterval,
 		reconnectCh:       make(chan struct{}, 1),
-		logger:            zap.NewNop(),
+		logger:            params.Logger,
 		reconnectBackoff: backoff.Config{
 			BaseDelay:  DefaultReconnectBackoff,
 			Multiplier: 1.5,
@@ -273,7 +283,7 @@ func (m *Manager) handleServerMessage(msg *proto.ShardDistributorStreamResponse)
 	ctx := context.Background()
 	for _, handler := range handlers {
 		if err := handler(ctx, msg); err != nil {
-			m.logger.Warn("Handler error",
+			m.logger.Warn("HandlerRegistry error",
 				zap.String("messageType", msg.Type.String()),
 				zap.Error(err))
 		}

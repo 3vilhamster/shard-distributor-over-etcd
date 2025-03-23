@@ -2,16 +2,14 @@ package reconcile
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
 
 	"github.com/jonboulle/clockwork"
-	"go.uber.org/fx"
 	"go.uber.org/zap"
 
-	"github.com/3vilhamster/shard-distributor-over-etcd/gen/proto"
+	"github.com/3vilhamster/shard-distributor-over-etcd/gen/proto/sharddistributor/v1"
 	"github.com/3vilhamster/shard-distributor-over-etcd/pkg/server/distribution"
 	"github.com/3vilhamster/shard-distributor-over-etcd/pkg/server/registry"
 	"github.com/3vilhamster/shard-distributor-over-etcd/pkg/server/store"
@@ -30,7 +28,7 @@ type Reconciler struct {
 	forced               chan struct{}
 	isLeader             bool
 	distributionStrategy distribution.Strategy
-	shardGroups          map[string]bool // Tracks which shard groups to reconcile
+	namespace            string
 
 	// Metrics for monitoring
 	lastReconcileTime time.Time
@@ -41,14 +39,13 @@ type Reconciler struct {
 
 // ReconcilerParams defines dependencies for creating a Reconciler
 type ReconcilerParams struct {
-	fx.In
-
-	Registry *registry.Registry
-	Store    store.Store
-	Logger   *zap.Logger
-	Clock    clockwork.Clock       `optional:"true"`
-	Interval time.Duration         `optional:"true" name:"reconcileInterval"`
-	Strategy distribution.Strategy `optional:"true"`
+	Namespace string
+	Registry  *registry.Registry
+	Store     store.Store
+	Logger    *zap.Logger
+	Clock     clockwork.Clock
+	Interval  time.Duration
+	Strategy  distribution.Strategy
 }
 
 // NewReconciler creates a new reconciler
@@ -64,11 +61,6 @@ func NewReconciler(params ReconcilerParams) *Reconciler {
 		interval = 5 * time.Second // Default interval
 	}
 
-	strategy := params.Strategy
-	if strategy == nil {
-		strategy = distribution.NewConsistentHashStrategy(10) // Default strategy
-	}
-
 	return &Reconciler{
 		registry:             params.Registry,
 		store:                params.Store,
@@ -77,8 +69,7 @@ func NewReconciler(params ReconcilerParams) *Reconciler {
 		clock:                clock,
 		stopCh:               make(chan struct{}),
 		forced:               make(chan struct{}, 1),
-		distributionStrategy: strategy,
-		shardGroups:          make(map[string]bool),
+		distributionStrategy: params.Strategy,
 	}
 }
 
@@ -94,42 +85,9 @@ func (r *Reconciler) Start(ctx context.Context) error {
 
 	r.logger.Info("Starting reconciler", zap.Duration("interval", r.interval))
 
-	// Load shard groups first
-	if err := r.loadShardGroups(ctx); err != nil {
-		r.logger.Warn("Failed to load shard groups", zap.Error(err))
-		// Continue anyway
-	}
-
-	// Run the first reconciliation immediately
-	go r.reconcileAllGroups()
-
 	// Start the reconciliation loop
 	go r.runReconcileLoop(ctx)
 
-	return nil
-}
-
-// loadShardGroups loads all shard groups from the store
-func (r *Reconciler) loadShardGroups(ctx context.Context) error {
-	r.logger.Info("Loading shard groups")
-
-	groups, err := r.store.GetShardGroups(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to load shard groups: %w", err)
-	}
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	// Clear existing groups
-	r.shardGroups = make(map[string]bool)
-
-	// Add each group for reconciliation
-	for groupID := range groups {
-		r.shardGroups[groupID] = true
-	}
-
-	r.logger.Info("Loaded shard groups", zap.Int("count", len(r.shardGroups)))
 	return nil
 }
 
@@ -179,72 +137,38 @@ func (r *Reconciler) runReconcileLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-r.forced:
-			go r.reconcileAllGroups()
+			go r.reconcileShardGroup()
 		case <-ticker.Chan():
-			go r.reconcileAllGroups()
+			go r.reconcileShardGroup()
 		}
 	}
-}
-
-// reconcileAllGroups reconciles all shard groups
-func (r *Reconciler) reconcileAllGroups() {
-	r.mu.Lock()
-	if !r.isLeader {
-		r.logger.Debug("Not leader, skipping reconciliation")
-		r.mu.Unlock()
-		return
-	}
-
-	r.lastReconcileTime = r.clock.Now()
-	r.reconcileCount++
-
-	// Make a copy of the shard groups to reconcile
-	groupsToReconcile := make([]string, 0, len(r.shardGroups))
-	for groupID := range r.shardGroups {
-		groupsToReconcile = append(groupsToReconcile, groupID)
-	}
-	r.mu.Unlock()
-
-	r.logger.Info("Starting reconciliation of all shard groups",
-		zap.Int("groupCount", len(groupsToReconcile)))
-
-	// For each shard group, perform reconciliation
-	for _, groupID := range groupsToReconcile {
-		if err := r.reconcileShardGroup(groupID); err != nil {
-			r.logger.Error("Failed to reconcile shard group",
-				zap.String("groupID", groupID),
-				zap.Error(err))
-		}
-	}
-
-	r.logger.Info("Completed reconciliation of all shard groups")
 }
 
 // reconcileShardGroup reconciles a specific shard group
-func (r *Reconciler) reconcileShardGroup(groupID string) {
-	r.logger.Info("Reconciling shard group", zap.String("groupID", groupID))
+func (r *Reconciler) reconcileShardGroup() {
+	r.logger.Info("Reconciling shard group", zap.String("namespace", r.namespace))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	// 1. Load shard group information
-	group, err := r.loadShardGroup(ctx, groupID)
+	group, err := r.loadShardGroup(ctx, r.namespace)
 	if err != nil {
-		r.logger.Fatal("Failed to load shard group", zap.String("groupID", groupID), zap.Error(err))
+		r.logger.Fatal("Failed to load shard group", zap.String("namespace", r.namespace), zap.Error(err))
 	}
 
 	// 2. Load current assignments for this group's shards
 	currentAssignments, err := r.loadAssignments(ctx, group.ShardIDs)
 	if err != nil {
-		r.logger.Fatal("Failed to load assignments", zap.String("groupID", groupID), zap.Error(err))
+		r.logger.Fatal("Failed to load assignments", zap.String("namespace", r.namespace), zap.Error(err))
 	}
 
 	// 3. Get active instances
 	instances := r.registry.GetActiveInstances()
 	if len(instances) == 0 {
 		r.logger.Warn("No active instances available for reconciliation",
-			zap.String("groupID", groupID))
-		return nil
+			zap.String("namespace", r.namespace))
+		return
 	}
 
 	// 4. Convert instances to the format needed for distribution strategy
@@ -259,54 +183,52 @@ func (r *Reconciler) reconcileShardGroup(groupID string) {
 	// 6. Compare old and new assignments
 	if distributionsEqual(currentAssignments, newDistribution) {
 		r.logger.Debug("No changes needed in distribution",
-			zap.String("groupID", groupID))
-		return nil
+			zap.String("namespace", r.namespace))
+		return
 	}
 
 	// 7. Apply new assignments to etcd and notify instances
 	r.logger.Info("Applying new shard distribution",
-		zap.String("groupID", groupID),
+		zap.String("namespace", r.namespace),
 		zap.Int("totalShards", len(newDistribution)))
 
-	if err := r.applyNewDistribution(ctx, groupID, currentAssignments, newDistribution); err != nil {
-		return fmt.Errorf("failed to apply new distribution: %w", err)
+	if err := r.applyNewDistribution(ctx, r.namespace, currentAssignments, newDistribution); err != nil {
+		r.logger.Warn("Failed to apply new shard distribution", zap.String("namespace", r.namespace), zap.Error(err))
+		return
 	}
 
-	return nil
+	return
 }
 
 // loadShardGroup loads a specific shard group
-func (r *Reconciler) loadShardGroup(ctx context.Context, groupID string) (*ShardGroup, error) {
-	data, err := r.store.GetShardGroup(ctx, groupID)
+func (r *Reconciler) loadShardGroup(ctx context.Context, groupID string) (Namespace, error) {
+	data, err := r.store.GetNamespace(ctx, groupID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get shard group: %w", err)
+		return Namespace{}, fmt.Errorf("failed to get shard group: %w", err)
 	}
 
-	group, err := DeserializeShardGroup(data)
-	if err != nil {
-		return nil, fmt.Errorf("failed to deserialize shard group: %w", err)
-	}
-
-	return group, nil
+	return Namespace{
+		Name:        data.Namespace,
+		ShardIDs:    data.ShardIDs,
+		Description: data.Description,
+		Metadata:    data.Metadata,
+	}, nil
 }
 
 // loadAssignments loads current assignments for the specified shards
-func (r *Reconciler) loadAssignments(ctx context.Context, shardIDs []string) (map[string]string, error) {
+func (r *Reconciler) loadAssignments(ctx context.Context, shardIDs []string) (map[string]store.Assignment, error) {
 	// Get all assignments
-	allAssignments, err := r.store.GetShardAssignments(ctx)
+	allAssignments, err := r.store.GetShardAssignments(ctx, r.namespace)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get shard assignments: %w", err)
 	}
 
 	// Filter to just the shards we need
-	assignments := make(map[string]string)
+	assignments := make(map[string]store.Assignment)
 	for _, shardID := range shardIDs {
 		instanceID, exists := allAssignments[shardID]
 		if exists {
 			assignments[shardID] = instanceID
-		} else {
-			// If not assigned, mark as empty
-			assignments[shardID] = ""
 		}
 	}
 
@@ -319,15 +241,13 @@ func convertInstances(instances map[string]*registry.InstanceData) map[string]di
 
 	for id, instance := range instances {
 		status := "active"
-		if instance.Status.Status == proto.StatusReport_DRAINING {
+		if instance.Status.Status == proto.StatusReport_STATUS_DRAINING {
 			status = "draining"
 		}
 
 		strategyInstances[id] = distribution.InstanceInfo{
-			ID:         id,
-			Status:     status,
-			LoadFactor: instance.Status.CpuUsage,
-			ShardCount: int(instance.Status.ActiveShardCount),
+			ID:     id,
+			Status: status,
 		}
 	}
 
@@ -335,7 +255,7 @@ func convertInstances(instances map[string]*registry.InstanceData) map[string]di
 }
 
 // distributionsEqual checks if two distributions are the same
-func distributionsEqual(a, b map[string]string) bool {
+func distributionsEqual(a, b map[string]store.Assignment) bool {
 	if len(a) != len(b) {
 		return false
 	}
@@ -353,7 +273,7 @@ func distributionsEqual(a, b map[string]string) bool {
 func (r *Reconciler) applyNewDistribution(
 	ctx context.Context,
 	groupID string,
-	currentAssignments, newDistribution map[string]string,
+	currentAssignments, newDistribution map[string]store.Assignment,
 ) error {
 	// 1. Save the new assignments to etcd
 	if err := r.store.SaveShardAssignments(ctx, groupID, newDistribution); err != nil {
@@ -377,81 +297,81 @@ func (r *Reconciler) applyNewDistribution(
 
 // DistributionChanges holds notifications for distribution changes
 type DistributionChanges struct {
-	assigns map[string][]*proto.ServerMessage
-	revokes map[string][]*proto.ServerMessage
+	assigns map[string][]*proto.ShardDistributorStreamResponse
+	revokes map[string][]*proto.ShardDistributorStreamResponse
 }
 
 // identifyChanges identifies the changes between old and new distributions
 func (r *Reconciler) identifyChanges(
-	old, new map[string]string,
+	old, new map[string]store.Assignment,
 ) DistributionChanges {
 	changes := DistributionChanges{
-		assigns: make(map[string][]*proto.ServerMessage),
-		revokes: make(map[string][]*proto.ServerMessage),
+		assigns: make(map[string][]*proto.ShardDistributorStreamResponse),
+		revokes: make(map[string][]*proto.ShardDistributorStreamResponse),
 	}
 
 	// Process additions and changes
-	for shardID, newInstanceID := range new {
-		oldInstanceID, exists := old[shardID]
+	for shardID, newAssignment := range new {
+		oldAssignment, exists := old[shardID]
 
-		if exists && oldInstanceID != "" && oldInstanceID != newInstanceID {
+		if exists && oldAssignment.OwnerID != newAssignment.OwnerID {
 			// This is a transfer
-			if newInstanceID != "" {
+			if newAssignment.NewOwnerID != "" {
 				// First prepare
-				prepareNotif := &proto.ServerMessage{
-					Type:             proto.ServerMessage_SHARD_ASSIGNMENT,
+				prepareNotif := &proto.ShardDistributorStreamResponse{
+					Type:             proto.ShardDistributorStreamResponse_MESSAGE_TYPE_SHARD_ASSIGNMENT,
 					ShardId:          shardID,
-					Action:           proto.ShardAssignmentAction_PREPARE,
-					SourceInstanceId: oldInstanceID,
+					Action:           proto.ShardAssignmentAction_SHARD_ASSIGNMENT_ACTION_PREPARE_ADD,
+					SourceInstanceId: newAssignment.OwnerID,
 				}
 
 				// Then assign
-				assignNotif := &proto.ServerMessage{
-					Type:             proto.ServerMessage_SHARD_ASSIGNMENT,
+				assignNotif := &proto.ShardDistributorStreamResponse{
+					Type:             proto.ShardDistributorStreamResponse_MESSAGE_TYPE_SHARD_ASSIGNMENT,
 					ShardId:          shardID,
-					Action:           proto.ShardAssignmentAction_ASSIGN,
-					SourceInstanceId: oldInstanceID,
+					Action:           proto.ShardAssignmentAction_SHARD_ASSIGNMENT_ACTION_ADD,
+					SourceInstanceId: oldAssignment.NewOwnerID,
 				}
 
 				// Add to changes
-				if _, ok := changes.assigns[newInstanceID]; !ok {
-					changes.assigns[newInstanceID] = make([]*proto.ServerMessage, 0)
+				if _, ok := changes.assigns[newAssignment.OwnerID]; !ok {
+					changes.assigns[newAssignment.OwnerID] = make([]*proto.ShardDistributorStreamResponse, 0)
 				}
-				changes.assigns[newInstanceID] = append(
-					changes.assigns[newInstanceID],
+				changes.assigns[newAssignment.OwnerID] = append(
+					changes.assigns[newAssignment.OwnerID],
 					prepareNotif,
 					assignNotif,
 				)
 			}
 
 			// Revoke from old instance
-			revokeNotif := &proto.ServerMessage{
-				Type:    proto.ServerMessage_SHARD_ASSIGNMENT,
+			revokeNotif := &proto.ShardDistributorStreamResponse{
+				Type:    proto.ShardDistributorStreamResponse_MESSAGE_TYPE_SHARD_ASSIGNMENT,
 				ShardId: shardID,
-				Action:  proto.ShardAssignmentAction_REVOKE,
+				Action:  proto.ShardAssignmentAction_SHARD_ASSIGNMENT_ACTION_DROP,
 			}
 
-			if _, ok := changes.revokes[oldInstanceID]; !ok {
-				changes.revokes[oldInstanceID] = make([]*proto.ServerMessage, 0)
+			if _, ok := changes.revokes[oldAssignment.OwnerID]; !ok {
+				changes.revokes[oldAssignment.OwnerID] = make([]*proto.ShardDistributorStreamResponse, 0)
 			}
-			changes.revokes[oldInstanceID] = append(
-				changes.revokes[oldInstanceID],
+			changes.revokes[oldAssignment.OwnerID] = append(
+				changes.revokes[oldAssignment.OwnerID],
 				revokeNotif,
 			)
-		} else if !exists || oldInstanceID != newInstanceID {
+		} else if !exists || oldAssignment.OwnerID != newAssignment.OwnerID {
 			// This is a new assignment (not a transfer)
-			if newInstanceID != "" {
-				assignNotif := &proto.ServerMessage{
-					Type:    proto.ServerMessage_SHARD_ASSIGNMENT,
+			if newAssignment.OwnerID != "" {
+				assignNotif := &proto.ShardDistributorStreamResponse{
+					Type:    proto.ShardDistributorStreamResponse_MESSAGE_TYPE_SHARD_ASSIGNMENT,
 					ShardId: shardID,
-					Action:  proto.ShardAssignmentAction_ASSIGN,
+					Action:  proto.ShardAssignmentAction_SHARD_ASSIGNMENT_ACTION_ADD,
 				}
 
-				if _, ok := changes.assigns[newInstanceID]; !ok {
-					changes.assigns[newInstanceID] = make([]*proto.ServerMessage, 0)
+				if _, ok := changes.assigns[newAssignment.OwnerID]; !ok {
+					changes.assigns[newAssignment.OwnerID] = make([]*proto.ShardDistributorStreamResponse, 0)
 				}
-				changes.assigns[newInstanceID] = append(
-					changes.assigns[newInstanceID],
+				changes.assigns[newAssignment.OwnerID] = append(
+					changes.assigns[newAssignment.OwnerID],
 					assignNotif,
 				)
 			}
@@ -510,18 +430,6 @@ func (r *Reconciler) sendAssignmentNotifications(changes DistributionChanges) {
 	}()
 }
 
-// ForceReconciliation forces an immediate reconciliation
-func (r *Reconciler) ForceReconciliation() {
-	go r.reconcileAllGroups()
-}
-
-// ForceReconciliationDueToInstanceChange forces reconciliation when an instance changes
-func (r *Reconciler) ForceReconciliationDueToInstanceChange(instanceID string) {
-	r.logger.Info("Forcing reconciliation due to instance change",
-		zap.String("instanceID", instanceID))
-	go r.reconcileAllGroups()
-}
-
 // GetReconcileMetrics returns reconciliation metrics
 func (r *Reconciler) GetReconcileMetrics() map[string]interface{} {
 	r.mu.RLock()
@@ -557,45 +465,10 @@ func (r *Reconciler) SetInterval(interval time.Duration) {
 	}
 }
 
-// ShardGroup represents a group of related shards
-type ShardGroup struct {
-	GroupID     string
+// Namespace represents a group of related shards
+type Namespace struct {
+	Name        string
 	ShardIDs    []string
 	Description string
 	Metadata    map[string]string
-}
-
-// DeserializeShardGroup creates a ShardGroup from a storage string
-func DeserializeShardGroup(data string) (*ShardGroup, error) {
-	// Using a stub implementation for now
-	return &ShardGroup{
-		GroupID:     "stub",
-		ShardIDs:    []string{},
-		Description: "Stub group",
-		Metadata:    make(map[string]string),
-	}, nil
-}
-
-// RegisterShardGroup creates a new shard group
-func (r *Reconciler) RegisterShardGroup(ctx context.Context, group *ShardGroup) error {
-	// Serialize the group
-	data, err := json.Marshal(group)
-	if err != nil {
-		return fmt.Errorf("marshal group: %w", err)
-	}
-
-	// Save to storage
-	if err := r.store.SaveShardGroup(ctx, group.GroupID, string(data)); err != nil {
-		return fmt.Errorf("failed to save shard group: %w", err)
-	}
-
-	// Add to local tracking
-	r.mu.Lock()
-	r.shardGroups[group.GroupID] = true
-	r.mu.Unlock()
-
-	// Force immediate reconciliation
-	go r.reconcileShardGroup(group.GroupID)
-
-	return nil
 }

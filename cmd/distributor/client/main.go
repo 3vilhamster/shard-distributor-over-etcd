@@ -15,8 +15,10 @@ import (
 	"go.uber.org/fx"
 	"go.uber.org/zap"
 
+	proto "github.com/3vilhamster/shard-distributor-over-etcd/gen/proto/sharddistributor/v1"
 	"github.com/3vilhamster/shard-distributor-over-etcd/pkg/client"
 	"github.com/3vilhamster/shard-distributor-over-etcd/pkg/client/config"
+	"github.com/3vilhamster/shard-distributor-over-etcd/pkg/client/connection"
 	"github.com/3vilhamster/shard-distributor-over-etcd/pkg/client/shard"
 )
 
@@ -48,7 +50,7 @@ func main() {
 		InstanceID:           id,
 		HeartbeatInterval:    *heartbeatInterval,
 		HealthReportInterval: *reportInterval,
-		ShardProcessorConfig: shard.ProcessorConfig{
+		ShardProcessorConfig: config.ProcessorConfig{
 			MaxConcurrentTransfers:   5,
 			ShardActivationTimeout:   30 * time.Second,
 			ShardDeactivationTimeout: 30 * time.Second,
@@ -102,7 +104,18 @@ func main() {
 			return registry
 		}),
 
+		fx.Provide(func() *proto.InstanceInfo {
+			// Create instance info
+			return &proto.InstanceInfo{
+				InstanceId: *instanceID,
+			}
+		}),
+
+		fx.Provide(connection.NewManager),
+
 		fx.Provide(client.NewService),
+
+		fx.Invoke(func(service *client.Service) {}),
 	)
 
 	// Setup signal handling for graceful shutdown

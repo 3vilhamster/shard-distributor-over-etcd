@@ -16,9 +16,9 @@ type ExampleShardHandler struct {
 }
 
 // NewExampleShardHandler creates a new example shard handler
-func NewExampleShardHandler(shardType string, logger *zap.Logger) *ExampleShardHandler {
+func NewExampleShardHandler(namespace string, logger *zap.Logger) *ExampleShardHandler {
 	return &ExampleShardHandler{
-		BaseHandler: shard.BaseHandler{ShardType: shardType},
+		BaseHandler: shard.NewBaseHandler(namespace),
 		logger:      logger,
 	}
 }

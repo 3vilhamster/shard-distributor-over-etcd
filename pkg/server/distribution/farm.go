@@ -2,6 +2,8 @@ package distribution
 
 import (
 	"github.com/dgryski/go-farm" // Import the farmhash library
+
+	"github.com/3vilhamster/shard-distributor-over-etcd/pkg/server/store"
 )
 
 // FarmHashDistributor provides a straightforward hash-based distribution
@@ -18,11 +20,11 @@ func (d *FarmHashDistributor) Name() string {
 
 // CalculateDistribution determines shard placement using simple hash distribution
 func (d *FarmHashDistributor) CalculateDistribution(
-	currentMap map[string]string,
+	currentMap map[string]store.Assignment,
 	instances map[string]InstanceInfo,
-) map[string]string {
+) map[string]store.Assignment {
 	// Create a new distribution map
-	distribution := make(map[string]string)
+	distribution := make(map[string]store.Assignment)
 
 	// If no instances available, return empty map
 	if len(instances) == 0 {
@@ -51,7 +53,9 @@ func (d *FarmHashDistributor) CalculateDistribution(
 		idx := hash % len(hosts)
 
 		// Assign shard to selected instance
-		distribution[shardID] = hosts[idx]
+		distribution[shardID] = store.Assignment{
+			OwnerID: hosts[idx],
+		}
 	}
 
 	return distribution

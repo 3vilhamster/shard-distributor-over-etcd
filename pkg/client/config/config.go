@@ -2,8 +2,6 @@ package config
 
 import (
 	"time"
-
-	"github.com/3vilhamster/shard-distributor-over-etcd/pkg/client/shard"
 )
 
 // ServiceConfig defines configuration for the client service
@@ -30,9 +28,11 @@ type ServiceConfig struct {
 	HealthReportInterval time.Duration
 
 	// ShardProcessorConfig is the configuration for the shard processor
-	ShardProcessorConfig shard.ProcessorConfig
+	ShardProcessorConfig ProcessorConfig
 
 	Namespaces []string
+
+	ReconcileInterval time.Duration
 }
 
 // DefaultServiceConfig provides default configuration values
@@ -42,5 +42,5 @@ var DefaultServiceConfig = ServiceConfig{
 	ReconnectJitter:      0.2,
 	HeartbeatInterval:    5 * time.Second,
 	HealthReportInterval: 10 * time.Second,
-	ShardProcessorConfig: shard.DefaultProcessorConfig,
+	ShardProcessorConfig: DefaultProcessorConfig,
 }

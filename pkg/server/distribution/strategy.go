@@ -1,7 +1,7 @@
 package distribution
 
 import (
-	"go.uber.org/fx"
+	"github.com/3vilhamster/shard-distributor-over-etcd/pkg/server/store"
 )
 
 // InstanceInfo contains information about a service instance
@@ -22,19 +22,13 @@ type Strategy interface {
 	// It takes the current shard-to-instance mapping and available instances,
 	// and returns a new shard-to-instance mapping
 	CalculateDistribution(
-		currentMap map[string]string,
+		currentMap map[string]store.Assignment,
 		instances map[string]InstanceInfo,
-	) map[string]string
+	) map[string]store.Assignment
 
 	// Name returns the name of the strategy
 	Name() string
 }
-
-// Module provides an Fx module for registering distribution strategies
-var Module = fx.Provide(
-	NewConsistentHashStrategy,
-	NewFarmHashStrategy,
-)
 
 // StrategyRegistry keeps track of available distribution strategies
 type StrategyRegistry struct {

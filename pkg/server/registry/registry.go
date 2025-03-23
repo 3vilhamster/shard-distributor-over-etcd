@@ -2,7 +2,6 @@ package registry
 
 import (
 	"context"
-	"fmt"
 	"sync"
 	"time"
 
@@ -10,7 +9,7 @@ import (
 	"go.uber.org/fx"
 	"go.uber.org/zap"
 
-	"github.com/3vilhamster/shard-distributor-over-etcd/gen/proto"
+	"github.com/3vilhamster/shard-distributor-over-etcd/gen/proto/sharddistributor/v1"
 	"github.com/3vilhamster/shard-distributor-over-etcd/pkg/server/store"
 )
 
@@ -24,9 +23,9 @@ type Registry struct {
 	clock        clockwork.Clock
 
 	// Callback functions for instance lifecycle events
-	onInstanceRegistered   func(instanceID string)
-	onInstanceDeregistered func(instanceID string)
-	onInstanceDraining     func(instanceID string)
+	onInstanceRegistered   func(namespace, instanceID string)
+	onInstanceDeregistered func(namespace, instanceID string)
+	onInstanceDraining     func(namespace, instanceID string)
 
 	// Workload assignment tracking
 	workloadAssignments map[string]map[string]bool // map[workloadType]map[instanceID]bool
@@ -59,65 +58,11 @@ func NewRegistry(params Params) *Registry {
 	}
 }
 
-// RegisterInstance registers a new service instance
-func (r *Registry) RegisterInstance(
-	ctx context.Context,
-	instanceInfo *proto.InstanceInfo,
-	stream proto.ShardDistributor_ShardDistributorStreamServer,
-	peerAddr string,
-) (*proto.ServerMessage, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	instanceID := instanceInfo.InstanceId
-	r.logger.Info("Instance registering", zap.String("instance", instanceID))
-
-	// Register in etcd
-	if err := r.store.SaveInstance(ctx, instanceID, peerAddr, r.heartbeatTTL); err != nil {
-		return &proto.ServerMessage{
-			Type:    proto.ServerMessage_REGISTER_RESPONSE,
-			Success: false,
-			Message: fmt.Sprintf("Failed to register in etcd: %v", err),
-		}, nil
-	}
-
-	// Create or update instance data
-	if existingInstance, exists := r.instances[instanceID]; exists {
-		// Update existing instance
-		existingInstance.Info = instanceInfo
-		existingInstance.UpdateHeartbeat()
-		existingInstance.AddStream(stream)
-
-		// Log reconnection
-		existingInstance.Stats.ReconnectCount++
-		r.logger.Info("Instance reconnected",
-			zap.String("instance", instanceID),
-			zap.Int("reconnect_count", existingInstance.Stats.ReconnectCount))
-	} else {
-		// Create new instance
-		instance := NewInstanceData(instanceID, instanceInfo, peerAddr, r.clock)
-		instance.AddStream(stream)
-		r.instances[instanceID] = instance
-
-		// Notify callback if this is a new registration
-		if r.onInstanceRegistered != nil {
-			go r.onInstanceRegistered(instanceID)
-		}
-	}
-
-	// Return success response
-	return &proto.ServerMessage{
-		Type:    proto.ServerMessage_REGISTER_RESPONSE,
-		Success: true,
-		Message: "Instance registered successfully",
-	}, nil
-}
-
 // UpdateInstanceStatus updates the status of a service instance
 func (r *Registry) UpdateInstanceStatus(
 	ctx context.Context,
 	status *proto.StatusReport,
-) (*proto.ServerMessage, error) {
+) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -126,16 +71,12 @@ func (r *Registry) UpdateInstanceStatus(
 	// Find the instance
 	instance, exists := r.instances[instanceID]
 	if !exists {
-		return &proto.ServerMessage{
-			Type:    proto.ServerMessage_STATUS_RESPONSE,
-			Success: false,
-			Message: "Instance not found",
-		}, nil
+		return nil
 	}
 
 	// Check if transitioning to DRAINING
-	wasActive := instance.Status.Status == proto.StatusReport_ACTIVE
-	isDraining := status.Status == proto.StatusReport_DRAINING
+	wasActive := instance.Status.Status == proto.StatusReport_STATUS_ACTIVE
+	isDraining := status.Status == proto.StatusReport_STATUS_DRAINING
 	needsCallback := wasActive && isDraining
 
 	// Update status
@@ -143,18 +84,16 @@ func (r *Registry) UpdateInstanceStatus(
 
 	// Call draining callback if needed
 	if needsCallback && r.onInstanceDraining != nil {
-		go r.onInstanceDraining(instanceID)
+		for _, ns := range status.Namespaces {
+			go r.onInstanceDraining(ns, instanceID)
+		}
 	}
 
-	return &proto.ServerMessage{
-		Type:    proto.ServerMessage_STATUS_RESPONSE,
-		Success: true,
-		Message: "Status updated",
-	}, nil
+	return nil
 }
 
 // HandleInstanceDisconnect processes an instance disconnection
-func (r *Registry) HandleInstanceDisconnect(instanceID string, stream proto.ShardDistributor_ShardDistributorStreamServer) {
+func (r *Registry) HandleInstanceDisconnect(instanceID string, stream proto.ShardDistributorService_ShardDistributorStreamServer) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -218,7 +157,7 @@ func (r *Registry) GetInstance(instanceID string) (*InstanceData, bool) {
 }
 
 // GetInstanceStreams returns the streams for a given instance
-func (r *Registry) GetInstanceStreams(instanceID string) []proto.ShardDistributor_ShardDistributorStreamServer {
+func (r *Registry) GetInstanceStreams(instanceID string) []proto.ShardDistributorService_ShardDistributorStreamServer {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
@@ -228,7 +167,7 @@ func (r *Registry) GetInstanceStreams(instanceID string) []proto.ShardDistributo
 	}
 
 	// Return a copy to avoid concurrent modification
-	streams := make([]proto.ShardDistributor_ShardDistributorStreamServer, len(instance.Streams))
+	streams := make([]proto.ShardDistributorService_ShardDistributorStreamServer, len(instance.Streams))
 	copy(streams, instance.Streams)
 
 	return streams
@@ -236,9 +175,9 @@ func (r *Registry) GetInstanceStreams(instanceID string) []proto.ShardDistributo
 
 // SetCallbacks sets the callbacks for instance events
 func (r *Registry) SetCallbacks(
-	onRegistered func(string),
-	onDeregistered func(string),
-	onDraining func(string),
+	onRegistered func(namespace, instanceID string),
+	onDeregistered func(namespace, instanceID string),
+	onDraining func(namespace, instanceID string),
 ) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -246,48 +185,6 @@ func (r *Registry) SetCallbacks(
 	r.onInstanceRegistered = onRegistered
 	r.onInstanceDeregistered = onDeregistered
 	r.onInstanceDraining = onDraining
-}
-
-// RemoveUnhealthyInstances removes instances that haven't sent heartbeats
-func (r *Registry) RemoveUnhealthyInstances(timeout time.Duration) []string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	now := r.clock.Now()
-	removed := []string{}
-
-	for id, instance := range r.instances {
-		if instance.TimeSinceHeartbeat() > timeout {
-			// Update stats before removal
-			instance.Stats.LastDisconnectAt = now
-
-			// Remove from map
-			delete(r.instances, id)
-			removed = append(removed, id)
-
-			// Log removal
-			r.logger.Info("Removed unhealthy instance",
-				zap.String("instance", id),
-				zap.Duration("timeout", timeout),
-				zap.Duration("time_since_heartbeat", instance.TimeSinceHeartbeat()))
-
-			// Delete from etcd in background
-			go func(instanceID string) {
-				if err := r.store.DeleteInstance(context.Background(), instanceID); err != nil {
-					r.logger.Warn("Failed to remove unhealthy instance from etcd",
-						zap.String("instance", instanceID),
-						zap.Error(err))
-				}
-			}(id)
-
-			// Notify callback
-			if r.onInstanceDeregistered != nil {
-				go r.onInstanceDeregistered(id)
-			}
-		}
-	}
-
-	return removed
 }
 
 // AssignInstanceToWorkload assigns an instance to a workload type
@@ -364,16 +261,4 @@ func (r *Registry) GetActiveInstanceCount() int {
 	}
 
 	return count
-}
-
-// SetClock sets the clock for testing purposes
-func (r *Registry) SetClock(clock clockwork.Clock) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.clock = clock
-
-	// Update clock in all instances too
-	for _, instance := range r.instances {
-		instance.clock = clock
-	}
 }

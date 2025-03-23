@@ -17,7 +17,6 @@ import (
 	"github.com/3vilhamster/shard-distributor-over-etcd/pkg/server"
 	"github.com/3vilhamster/shard-distributor-over-etcd/pkg/server/config"
 	"github.com/3vilhamster/shard-distributor-over-etcd/pkg/server/distribution"
-	"github.com/3vilhamster/shard-distributor-over-etcd/pkg/server/health"
 	"github.com/3vilhamster/shard-distributor-over-etcd/pkg/server/leader"
 	"github.com/3vilhamster/shard-distributor-over-etcd/pkg/server/reconcile"
 	"github.com/3vilhamster/shard-distributor-over-etcd/pkg/server/registry"
@@ -33,18 +32,19 @@ func main() {
 	healthCheckInterval := flag.Duration("health-interval", 5*time.Second, "Health check interval")
 	logLevel := flag.String("log-level", "info", "Log level (debug, info, warn, error)")
 	leaderElectionPath := flag.String("leader-path", "/shard-distributor/leader", "Leader election path")
-	distributionStrategy := flag.String("strategy", "farmHash", "Distribution strategy (consistentHash, farmHash)")
+	distributionStrategy := flag.String("strategy", "farmHash", "Distribution strategy (farmHash)")
 	virtualNodes := flag.Int("virtual-nodes", 10, "Virtual nodes for consistent hashing")
 	flag.Parse()
 
 	// Create app configuration
 	serverConfig := config.Config{
-		EtcdEndpoints:       []string{*etcdAddr},
-		ListenAddr:          *serverAddr,
-		LeaderElectionPath:  *leaderElectionPath,
-		ShardCount:          *numShards,
-		ReconcileInterval:   *reconcileInterval,
-		HealthCheckInterval: *healthCheckInterval,
+		EtcdEndpoints:        []string{*etcdAddr},
+		ListenAddr:           *serverAddr,
+		LeaderElectionPath:   *leaderElectionPath,
+		ShardCount:           *numShards,
+		ReconcileInterval:    *reconcileInterval,
+		HealthCheckInterval:  *healthCheckInterval,
+		LeaderElectionPrefix: "/leader-election",
 	}
 
 	fmt.Println("Starting with config:", serverConfig)
@@ -121,10 +121,8 @@ func main() {
 		// Provide distribution strategy
 		fx.Provide(func(logger *zap.Logger) distribution.Strategy {
 			switch *distributionStrategy {
-			case "farmHash":
+			default:
 				return distribution.NewFarmHashStrategy()
-			default: // consistentHash
-				return distribution.NewConsistentHashStrategy(*virtualNodes)
 			}
 		}),
 
@@ -132,7 +130,6 @@ func main() {
 		fx.Provide(store.NewEtcdStore),
 		fx.Provide(registry.NewRegistry),
 		fx.Provide(leader.NewElection),
-		fx.Provide(health.NewChecker),
 		fx.Provide(reconcile.NewReconciler),
 
 		// Provide the service

@@ -3,7 +3,7 @@ package registry
 import (
 	"time"
 
-	"github.com/3vilhamster/shard-distributor-over-etcd/gen/proto"
+	"github.com/3vilhamster/shard-distributor-over-etcd/gen/proto/sharddistributor/v1"
 )
 
 // InstanceData contains information about a service instance
@@ -15,7 +15,7 @@ type InstanceData struct {
 	Endpoint   string
 
 	// Communication streams
-	Streams []proto.ShardDistributor_ShardDistributorStreamServer
+	Streams []proto.ShardDistributorService_ShardDistributorStreamServer
 
 	// Stats and metrics
 	Stats InstanceStats
@@ -50,10 +50,10 @@ func NewInstanceData(
 		Info:       info,
 		Status: &proto.StatusReport{
 			InstanceId: instanceID,
-			Status:     proto.StatusReport_ACTIVE,
+			Status:     proto.StatusReport_STATUS_ACTIVE,
 		},
 		Endpoint: endpoint,
-		Streams:  make([]proto.ShardDistributor_ShardDistributorStreamServer, 0),
+		Streams:  make([]proto.ShardDistributorService_ShardDistributorStreamServer, 0),
 		Stats: InstanceStats{
 			ConnectedAt: now,
 		},
@@ -61,12 +61,12 @@ func NewInstanceData(
 }
 
 // AddStream adds a new stream to the instance
-func (i *InstanceData) AddStream(stream proto.ShardDistributor_ShardDistributorStreamServer) {
+func (i *InstanceData) AddStream(stream proto.ShardDistributorService_ShardDistributorStreamServer) {
 	i.Streams = append(i.Streams, stream)
 }
 
 // RemoveStream removes a stream from the instance
-func (i *InstanceData) RemoveStream(stream proto.ShardDistributor_ShardDistributorStreamServer) bool {
+func (i *InstanceData) RemoveStream(stream proto.ShardDistributorService_ShardDistributorStreamServer) bool {
 	for idx, s := range i.Streams {
 		if s == stream {
 			// Remove this stream by replacing with the last element and truncating
@@ -89,13 +89,9 @@ func (i *InstanceData) GetStreamCount() int {
 // UpdateStatus updates the instance status
 func (i *InstanceData) UpdateStatus(status *proto.StatusReport) {
 	i.Status = status
-
-	// Update stats
-	i.Stats.CurrentActiveShards = int(status.ActiveShardCount)
-	i.Stats.CurrentStandbyShards = int(status.StandbyShardCount)
 }
 
 // IsDraining returns whether the instance is in draining state
 func (i *InstanceData) IsDraining() bool {
-	return i.Status.Status == proto.StatusReport_DRAINING
+	return i.Status.Status == proto.StatusReport_STATUS_DRAINING
 }

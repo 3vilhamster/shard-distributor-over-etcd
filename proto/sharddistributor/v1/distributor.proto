@@ -82,5 +82,7 @@ message StatusReport {
   }
   Status status = 2;
 
-  map<string,string> metadata = 3;
+  repeated string namespaces = 3;
+
+  map<string,string> metadata = 4;
 }

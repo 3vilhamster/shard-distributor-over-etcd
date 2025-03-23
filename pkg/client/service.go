@@ -9,7 +9,6 @@ import (
 	"go.uber.org/fx"
 	"go.uber.org/zap"
 
-	"github.com/3vilhamster/shard-distributor-over-etcd/gen/proto/sharddistributor/v1"
 	"github.com/3vilhamster/shard-distributor-over-etcd/pkg/client/config"
 	"github.com/3vilhamster/shard-distributor-over-etcd/pkg/client/connection"
 	"github.com/3vilhamster/shard-distributor-over-etcd/pkg/client/shard"
@@ -35,11 +34,10 @@ type Service struct {
 type ServiceParams struct {
 	fx.In
 
-	Cfg     config.ServiceConfig
-	Logger  *zap.Logger
-	Handler *shard.HandlerRegistry
-
-	Lifecycle fx.Lifecycle
+	Cfg             config.ServiceConfig
+	Logger          *zap.Logger
+	HandlerRegistry *shard.HandlerRegistry
+	ConnManager     *connection.Manager
 }
 
 // NewService creates a new client service
@@ -71,41 +69,26 @@ func NewService(params ServiceParams) (*Service, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// Create instance info
-	instanceInfo := &proto.InstanceInfo{
-		InstanceId: params.Cfg.InstanceID,
-	}
-
-	// Create connection manager
-	connMgr := connection.NewManager(
-		params.Cfg.ServerAddr,
-		params.Cfg.InstanceID,
-		instanceInfo,
-	)
-
 	// Create state manager
 	stateMgr := shard.NewStateManager()
-
-	// Create handler registry
-	handlerReg := shard.NewHandlerRegistry()
 
 	service := &Service{
 		config:          params.Cfg,
 		logger:          params.Logger,
-		connectionMgr:   connMgr,
+		connectionMgr:   params.ConnManager,
 		stateManager:    stateMgr,
-		handlerReg:      handlerReg,
+		handlerReg:      params.HandlerRegistry,
 		readyCh:         make(chan struct{}),
 		ctx:             ctx,
 		cancel:          cancel,
-		hanlderRegistry: params.Handler,
+		hanlderRegistry: params.HandlerRegistry,
 		shardProcessors: make(map[string]*shard.Processor),
 	}
 
 	for _, ns := range params.Cfg.Namespaces {
 		service.shardProcessors[ns] = shard.NewProcessor(
 			ns,
-			connMgr,
+			params.ConnManager,
 			stateMgr,
 			params.Logger,
 			params.Cfg.ShardProcessorConfig,
@@ -119,11 +102,6 @@ func NewService(params ServiceParams) (*Service, error) {
 
 	}
 
-	params.Lifecycle.Append(fx.Hook{
-		OnStart: service.Start,
-		OnStop:  service.Stop,
-	})
-
 	return service, nil
 }
 
@@ -131,10 +109,12 @@ func NewService(params ServiceParams) (*Service, error) {
 func (s *Service) RegisterShardHandler(namespace string) error {
 	s.logger.Info("Registering shard handler", zap.String("namespace", namespace))
 
+	fmt.Println(s.handlerReg)
+
 	// Create a handler instance
 	factory := s.handlerReg.GetFactory(namespace)
 	if factory == nil {
-		return fmt.Errorf("failed to create handler for shard type: %s", namespace)
+		return fmt.Errorf("failed to create handler for shard type: %s=", namespace)
 	}
 
 	handler := factory(s.logger)

@@ -11,33 +11,14 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/3vilhamster/shard-distributor-over-etcd/gen/proto/sharddistributor/v1"
+	config2 "github.com/3vilhamster/shard-distributor-over-etcd/pkg/client/config"
 	"github.com/3vilhamster/shard-distributor-over-etcd/pkg/client/connection"
 )
-
-// ProcessorConfig defines configuration for the shard processor
-type ProcessorConfig struct {
-	// MaxConcurrentTransfers is the maximum number of concurrent shard transfers
-	MaxConcurrentTransfers int
-	// ShardActivationTimeout is the maximum time to wait for a shard to activate
-	ShardActivationTimeout time.Duration
-	// ShardDeactivationTimeout is the maximum time to wait for a shard to deactivate
-	ShardDeactivationTimeout time.Duration
-	// AssignmentQueueSize is the size of the assignment queue
-	AssignmentQueueSize int
-}
-
-// DefaultProcessorConfig provides default configuration values
-var DefaultProcessorConfig = ProcessorConfig{
-	MaxConcurrentTransfers:   5,
-	ShardActivationTimeout:   30 * time.Second,
-	ShardDeactivationTimeout: 30 * time.Second,
-	AssignmentQueueSize:      100,
-}
 
 // Processor manages shard assignments and their lifecycle
 type Processor struct {
 	namespace       string
-	config          ProcessorConfig
+	config          config2.ProcessorConfig
 	connectionMgr   *connection.Manager
 	stateManager    *StateManager
 	handlers        map[string]Handler
@@ -56,21 +37,21 @@ func NewProcessor(
 	connectionMgr *connection.Manager,
 	stateManager *StateManager,
 	logger *zap.Logger,
-	config ProcessorConfig,
+	config config2.ProcessorConfig,
 ) *Processor {
 
 	// Use default config if needed
 	if config.MaxConcurrentTransfers <= 0 {
-		config.MaxConcurrentTransfers = DefaultProcessorConfig.MaxConcurrentTransfers
+		config.MaxConcurrentTransfers = config2.DefaultProcessorConfig.MaxConcurrentTransfers
 	}
 	if config.ShardActivationTimeout <= 0 {
-		config.ShardActivationTimeout = DefaultProcessorConfig.ShardActivationTimeout
+		config.ShardActivationTimeout = config2.DefaultProcessorConfig.ShardActivationTimeout
 	}
 	if config.ShardDeactivationTimeout <= 0 {
-		config.ShardDeactivationTimeout = DefaultProcessorConfig.ShardDeactivationTimeout
+		config.ShardDeactivationTimeout = config2.DefaultProcessorConfig.ShardDeactivationTimeout
 	}
 	if config.AssignmentQueueSize <= 0 {
-		config.AssignmentQueueSize = DefaultProcessorConfig.AssignmentQueueSize
+		config.AssignmentQueueSize = config2.DefaultProcessorConfig.AssignmentQueueSize
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

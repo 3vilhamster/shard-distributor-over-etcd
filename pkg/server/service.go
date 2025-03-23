@@ -6,7 +6,6 @@ import (
 	"io"
 	"net"
 	"sync"
-	"time"
 
 	"github.com/jonboulle/clockwork"
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -19,20 +18,18 @@ import (
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 
-	"github.com/3vilhamster/shard-distributor-over-etcd/gen/proto"
+	"github.com/3vilhamster/shard-distributor-over-etcd/gen/proto/sharddistributor/v1"
 	config2 "github.com/3vilhamster/shard-distributor-over-etcd/pkg/server/config"
 	"github.com/3vilhamster/shard-distributor-over-etcd/pkg/server/distribution"
-	"github.com/3vilhamster/shard-distributor-over-etcd/pkg/server/health"
 	"github.com/3vilhamster/shard-distributor-over-etcd/pkg/server/leader"
 	"github.com/3vilhamster/shard-distributor-over-etcd/pkg/server/reconcile"
 	"github.com/3vilhamster/shard-distributor-over-etcd/pkg/server/registry"
-	"github.com/3vilhamster/shard-distributor-over-etcd/pkg/server/shard"
 	"github.com/3vilhamster/shard-distributor-over-etcd/pkg/server/store"
 )
 
 // Service implements the shard distributor service
 type Service struct {
-	proto.UnimplementedShardDistributorServer
+	proto.UnimplementedShardDistributorServiceServer
 
 	mu         sync.RWMutex
 	config     config2.Config
@@ -43,9 +40,8 @@ type Service struct {
 	// Components
 	leaderElection   *leader.Election
 	instanceRegistry *registry.Registry
-	healthChecker    *health.Checker
 	stateStore       store.Store
-	reconciler       *reconcile.Reconciler
+	reconcilers      map[string]*reconcile.Reconciler
 	strategyRegistry *distribution.StrategyRegistry
 
 	isRunning bool
@@ -60,13 +56,11 @@ type ServiceParams struct {
 	Lifecycle        fx.Lifecycle
 	Config           config2.Config
 	Logger           *zap.Logger
-	Clock            clockwork.Clock `optional:"true"`
+	Clock            clockwork.Clock
 	EtcdClient       *clientv3.Client
 	LeaderElection   *leader.Election
 	InstanceRegistry *registry.Registry
-	HealthChecker    *health.Checker
 	StateStore       store.Store
-	Reconciler       *reconcile.Reconciler
 	Strategy         distribution.Strategy `optional:"true"`
 }
 
@@ -94,9 +88,7 @@ func NewService(params ServiceParams) (*Service, error) {
 		grpcServer:       grpc.NewServer(),
 		leaderElection:   params.LeaderElection,
 		instanceRegistry: params.InstanceRegistry,
-		healthChecker:    params.HealthChecker,
 		stateStore:       params.StateStore,
-		reconciler:       params.Reconciler,
 		strategyRegistry: strategyRegistry,
 		stopCh:           make(chan struct{}),
 	}
@@ -126,49 +118,32 @@ func NewService(params ServiceParams) (*Service, error) {
 		},
 	})
 
-	// Register health checker in lifecycle
-	params.Lifecycle.Append(fx.Hook{
-		OnStart: func(subCtx context.Context) error {
-			return svc.healthChecker.Start(subCtx)
-		},
-		OnStop: func(subCtx context.Context) error {
-			svc.healthChecker.Stop()
-			return nil
-		},
-	})
-
 	return svc, nil
 }
 
 // connectComponents connects the components with appropriate callbacks
 func (s *Service) connectComponents() {
 	// Set callbacks for instance registry
-	s.instanceRegistry.SetCallbacks(
-		// On instance registered
-		func(instanceID string) {
-			s.logger.Info("Instance registered callback", zap.String("instance", instanceID))
-			s.reconciler.ForceReconciliation()
-		},
-		// On instance deregistered
-		func(instanceID string) {
-			s.logger.Info("Instance deregistered callback", zap.String("instance", instanceID))
-			s.reconciler.ForceReconciliation()
-		},
-		// On instance draining
-		func(instanceID string) {
-			s.logger.Info("Instance draining callback", zap.String("instance", instanceID))
-			s.reconciler.ForceReconciliation()
-		},
-	)
+	//s.instanceRegistry.SetCallbacks(
+	//	// On instance registered
+	//	func(instanceID string) {
+	//		s.logger.Info("Instance registered callback", zap.String("instance", instanceID))
+	//		s.reconciler.ForceReconciliation()
+	//	},
+	//	// On instance deregistered
+	//	func(instanceID string) {
+	//		s.logger.Info("Instance deregistered callback", zap.String("instance", instanceID))
+	//		s.reconciler.ForceReconciliation()
+	//	},
+	//	// On instance draining
+	//	func(instanceID string) {
+	//		s.logger.Info("Instance draining callback", zap.String("instance", instanceID))
+	//		s.reconciler.ForceReconciliation()
+	//	},
+	//)
 
 	// Set callback for leadership changes
 	s.leaderElection.SetCallback(s.onLeadershipChange)
-
-	// Set health checker callback
-	s.healthChecker.SetCallback(func(instanceID string) {
-		s.logger.Info("Instance removed by health checker", zap.String("instance", instanceID))
-		s.recalculateDistribution()
-	})
 }
 
 // Start starts the shard distributor service
@@ -192,7 +167,7 @@ func (s *Service) Start(ctx context.Context) error {
 	s.listener = lis
 
 	healthgrpc.RegisterHealthServer(s.grpcServer, grpcHealth.NewServer())
-	proto.RegisterShardDistributorServer(s.grpcServer, s)
+	proto.RegisterShardDistributorServiceServer(s.grpcServer, s)
 
 	// Start the gRPC server
 	go func() {
@@ -237,47 +212,16 @@ func (s *Service) Stop() {
 func (s *Service) onLeadershipChange(isLeader bool) {
 	s.logger.Info("Leadership status changed", zap.Bool("is_leader", isLeader))
 
-	if isLeader {
-		s.shardManager.SetLeaderStatus(true)
-
-		// Start reconciler when becoming leader
-		err := s.reconciler.Start(context.Background())
-		if err != nil {
-			s.logger.Fatal("Failed to start reconciler", zap.Error(err))
-			return
-		}
-
-		s.shardManager.RecalculateDistribution()
-	} else {
-		s.shardManager.SetLeaderStatus(false)
-		s.reconciler.Stop() // Stop reconciler when losing leadership
-	}
-}
-
-// RegisterShardGroup creates a new shard group
-func (s *Service) RegisterShardGroup(
-	ctx context.Context,
-	groupID string,
-	shardCount int,
-	description string,
-	metadata map[string]string,
-) error {
-	return s.shardManager.RegisterShardGroup(ctx, groupID, shardCount, description, metadata)
-}
-
-// GetShardGroup gets a shard group by ID
-func (s *Service) GetShardGroup(groupID string) (*shard.Group, bool) {
-	return s.shardManager.GetShardGroup(groupID)
-}
-
-// GetAllShardGroups gets all shard groups
-func (s *Service) GetAllShardGroups() map[string]*shard.Group {
-	return s.shardManager.GetAllShardGroups()
-}
-
-// GetShardAssignments gets all shard assignments
-func (s *Service) GetShardAssignments() map[string]string {
-	return s.shardManager.GetShardAssignments()
+	//if isLeader {
+	//	// Start reconciler when becoming leader
+	//	err := s.reconciler.Start(context.Background())
+	//	if err != nil {
+	//		s.logger.Fatal("Failed to start reconciler", zap.Error(err))
+	//		return
+	//	}
+	//} else {
+	//	s.reconciler.Stop() // Stop reconciler when losing leadership
+	//}
 }
 
 // GetInstanceCount gets the number of registered instances
@@ -290,11 +234,6 @@ func (s *Service) GetActiveInstanceCount() int {
 	return s.instanceRegistry.GetActiveInstanceCount()
 }
 
-// GetTransferLatencyStats gets statistics about shard transfers
-func (s *Service) GetTransferLatencyStats() (min, max, avg time.Duration, count int) {
-	return s.shardManager.GetTransferLatencyStats()
-}
-
 // GetHealth returns the health status of the service
 func (s *Service) GetHealth() map[string]interface{} {
 	s.mu.RLock()
@@ -305,8 +244,6 @@ func (s *Service) GetHealth() map[string]interface{} {
 		"is_leader":        s.leaderElection.IsLeader(),
 		"instance_count":   s.instanceRegistry.GetInstanceCount(),
 		"active_instances": s.instanceRegistry.GetActiveInstanceCount(),
-		"shard_groups":     len(s.shardManager.GetAllShardGroups()),
-		"health_checker":   s.healthChecker.GetHealthMetrics(),
 	}
 }
 
@@ -327,16 +264,9 @@ func (s *Service) GetAvailableStrategies() []string {
 
 // ShardDistributorStream implements the gRPC service method
 func (s *Service) ShardDistributorStream(
-	stream proto.ShardDistributor_ShardDistributorStreamServer,
+	stream grpc.BidiStreamingServer[proto.ShardDistributorStreamRequest, proto.ShardDistributorStreamResponse],
 ) error {
 	// Handle stream messages from clients
-	return s.handleClientStream(stream)
-}
-
-// handleClientStream processes messages from a client stream
-func (s *Service) handleClientStream(
-	stream proto.ShardDistributor_ShardDistributorStreamServer,
-) error {
 	var instanceID string
 	var registered bool
 
@@ -388,110 +318,17 @@ func (s *Service) handleClientStream(
 
 		// Process the message based on its type
 		switch clientMsg.Type {
-		case proto.ClientMessage_REGISTER:
-			resp, err := s.instanceRegistry.RegisterInstance(
-				stream.Context(),
-				clientMsg.InstanceInfo,
-				stream,
-				peerAddr,
-			)
+		case proto.ShardDistributorStreamRequest_MESSAGE_TYPE_STOPPING:
+
+		case proto.ShardDistributorStreamRequest_MESSAGE_TYPE_HEARTBEAT:
+			err := s.instanceRegistry.UpdateInstanceStatus(context.Background(), clientMsg.Status)
 			if err != nil {
-				s.logger.Error("Failed to handle registration",
-					zap.String("instance", instanceID),
-					zap.Error(err))
-				return err
-			}
-
-			if resp.Success {
-				registered = true
-			}
-
-			// Send the response
-			err = stream.Send(resp)
-			if err != nil {
-				s.logger.Warn("Failed to send registration response",
-					zap.String("instance", instanceID),
-					zap.Error(err))
-				return err
-			}
-
-		case proto.ClientMessage_DEREGISTER:
-			if !registered {
-				return status.Error(codes.FailedPrecondition, "instance must register before deregistering")
-			}
-
-			resp, err := s.instanceRegistry.DeregisterInstance(stream.Context(), instanceID)
-			if err != nil {
-				s.logger.Error("Failed to handle deregistration",
-					zap.String("instance", instanceID),
-					zap.Error(err))
-				return err
-			}
-
-			if resp.Success {
-				registered = false
-
-				// Send the response
-				err = stream.Send(resp)
-				if err != nil {
-					s.logger.Warn("Failed to send deregistration response",
-						zap.String("instance", instanceID),
-						zap.Error(err))
-				}
-
-				// Disconnect after successful deregistration
-				return nil
-			}
-
-		case proto.ClientMessage_WATCH:
-			if !registered {
-				return status.Error(codes.FailedPrecondition, "instance must register before watching")
-			}
-
-			// Start watching for shard assignments
-			s.logger.Info("Instance watching for shard assignments",
-				zap.String("instance", instanceID))
-
-			// Get current assignments for this instance
-			assignments := s.shardManager.GetShardAssignments()
-
-			// Send initial assignments
-			for shardID, assignedInstanceID := range assignments {
-				if assignedInstanceID == instanceID {
-					version := s.shardManager.GetVersion(shardID)
-
-					err = stream.Send(&proto.ServerMessage{
-						Type:    proto.ServerMessage_SHARD_ASSIGNMENT,
-						ShardId: shardID,
-						Action:  proto.ShardAssignmentAction_ASSIGN,
-						Version: version,
-					})
-
-					if err != nil {
-						s.logger.Error("Error sending initial assignment",
-							zap.String("instance", instanceID),
-							zap.String("shard", shardID),
-							zap.Error(err))
-						return err
-					}
-				}
-			}
-
-		case proto.ClientMessage_HEARTBEAT:
-			if !registered {
-				return status.Error(codes.FailedPrecondition, "instance must register before sending heartbeats")
-			}
-
-			err := s.instanceRegistry.HandleHeartbeat(instanceID)
-			if err != nil {
-				s.logger.Warn("Failed to handle heartbeat",
-					zap.String("instance", instanceID),
-					zap.Error(err))
+				return fmt.Errorf("update instance status: %w", err)
 			}
 
 			// Send heartbeat acknowledgment
-			err = stream.Send(&proto.ServerMessage{
-				Type: proto.ServerMessage_HEARTBEAT_ACK,
+			err = stream.Send(&proto.ShardDistributorStreamResponse{
+				Type: proto.ShardDistributorStreamResponse_MESSAGE_TYPE_HEARTBEAT_ACK,
 			})
 			if err != nil {
 				s.logger.Warn("Failed to send heartbeat acknowledgment",
@@ -500,47 +337,13 @@ func (s *Service) handleClientStream(
 				return err
 			}
 
-		case proto.ClientMessage_ACK:
-			if !registered {
-				return status.Error(codes.FailedPrecondition, "instance must register before sending ACKs")
-			}
-
+		case proto.ShardDistributorStreamRequest_MESSAGE_TYPE_ACK:
 			// Handle acknowledgment of shard assignment
 			if clientMsg.ShardId != "" {
 				s.logger.Debug("Received assignment ACK",
 					zap.String("instance", instanceID),
 					zap.String("shard", clientMsg.ShardId))
-
-				// If this was a transfer, record completion
-				s.shardManager.RecordTransferCompletion(clientMsg.ShardId, instanceID)
-			}
-
-		case proto.ClientMessage_STATUS_REPORT:
-			if !registered {
-				return status.Error(codes.FailedPrecondition, "instance must register before reporting status")
-			}
-
-			resp, err := s.instanceRegistry.UpdateInstanceStatus(stream.Context(), clientMsg.Status)
-			if err != nil {
-				s.logger.Error("Failed to handle status report",
-					zap.String("instance", instanceID),
-					zap.Error(err))
-				return err
-			}
-
-			// Send the response
-			err = stream.Send(resp)
-			if err != nil {
-				s.logger.Warn("Failed to send status response",
-					zap.String("instance", instanceID),
-					zap.Error(err))
-				return err
 			}
 		}
 	}
-}
-
-// GetVersion gets the version for a shard (helper for handleClientStream)
-func (s *Service) GetVersion(shardID string) int64 {
-	return s.shardManager.GetVersion(shardID)
 }

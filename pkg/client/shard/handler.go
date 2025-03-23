@@ -22,8 +22,8 @@ type Handler interface {
 	// or properly saved before returning
 	Deactivate(ctx context.Context, shardID string) error
 
-	// GetType returns the type of shard this handler can process
-	GetType() string
+	// Namespace returns the type of shard this handler can process
+	Namespace() string
 
 	// GetStats returns statistics about the shard
 	GetStats(shardID string) (map[string]interface{}, error)
@@ -32,12 +32,18 @@ type Handler interface {
 // BaseHandler provides a base implementation of the Handler interface
 // that can be embedded in concrete handlers
 type BaseHandler struct {
-	ShardType string
+	namespace string
 }
 
-// GetType returns the type of shard this handler can process
-func (h *BaseHandler) GetType() string {
-	return h.ShardType
+func NewBaseHandler(namespace string) BaseHandler {
+	return BaseHandler{
+		namespace: namespace,
+	}
+}
+
+// Namespace returns the namespace of shard this handler can process
+func (h *BaseHandler) Namespace() string {
+	return h.namespace
 }
 
 // HandlerFactory is a function that creates a new handler
@@ -56,17 +62,13 @@ func NewHandlerRegistry() *HandlerRegistry {
 }
 
 // Register registers a factory for a specific shard type
-func (r *HandlerRegistry) Register(shardType string, factory HandlerFactory) {
-	r.factories[shardType] = factory
+func (r *HandlerRegistry) Register(namespace string, factory HandlerFactory) {
+	r.factories[namespace] = factory
 }
 
 // GetFactory returns a factory or nil.
-func (r *HandlerRegistry) GetFactory(shardType string) HandlerFactory {
-	factory, ok := r.factories[shardType]
-	if !ok {
-		return nil
-	}
-	return factory
+func (r *HandlerRegistry) GetFactory(namespace string) HandlerFactory {
+	return r.factories[namespace]
 }
 
 // GetTypes returns all registered shard types
@@ -76,23 +78,4 @@ func (r *HandlerRegistry) GetTypes() []string {
 		types = append(types, t)
 	}
 	return types
-}
-
-// HandlerConfig defines configuration for shard handlers
-type HandlerConfig struct {
-	// MaxConcurrentOperations is the maximum number of concurrent operations
-	MaxConcurrentOperations int
-
-	// ShutdownTimeout is the maximum time to wait for operations to complete on shutdown
-	ShutdownTimeout int
-
-	// Custom configuration options for specific handlers
-	CustomConfig map[string]interface{}
-}
-
-// DefaultShardHandlerConfig provides default configuration values
-var DefaultShardHandlerConfig = HandlerConfig{
-	MaxConcurrentOperations: 10,
-	ShutdownTimeout:         30, // seconds
-	CustomConfig:            make(map[string]interface{}),
 }

@@ -77,18 +77,18 @@ func (s *EtcdStore) shardGroupsPrefix() string {
 }
 
 // shardGroupKey returns the key for a specific shard group
-func (s *EtcdStore) shardGroupKey(groupID string) string {
-	return s.buildKey("groups", groupID)
+func (s *EtcdStore) shardGroupKey(namespace string) string {
+	return s.buildKey("groups", namespace)
 }
 
 // assignmentsPrefix returns the prefix for assignments within a group
-func (s *EtcdStore) assignmentsPrefix(groupID string) string {
-	return s.buildKey("assignments", groupID)
+func (s *EtcdStore) assignmentsPrefix(namespace string) string {
+	return s.buildKey("assignments", namespace)
 }
 
 // assignmentKey returns the key for a specific shard assignment
-func (s *EtcdStore) assignmentKey(groupID, shardID string) string {
-	return s.buildKey("assignments", groupID, shardID)
+func (s *EtcdStore) assignmentKey(namespace, shardID string) string {
+	return s.buildKey("assignments", namespace, shardID)
 }
 
 // SaveInstance saves an instance to etcd with TTL
@@ -141,14 +141,14 @@ func (s *EtcdStore) GetInstances(ctx context.Context) (map[string]string, error)
 // SaveShardAssignments saves shard assignments to etcd
 func (s *EtcdStore) SaveShardAssignments(
 	ctx context.Context,
-	groupID string,
+	namespace string,
 	assignments map[string]Assignment,
 ) error {
 	// Use a transaction for atomicity
 	ops := make([]clientv3.Op, 0, len(assignments))
 
 	for shardID, assignment := range assignments {
-		key := s.assignmentKey(groupID, shardID)
+		key := s.assignmentKey(namespace, shardID)
 
 		data, err := json.Marshal(assignment)
 		if err != nil {
@@ -172,9 +172,9 @@ func (s *EtcdStore) SaveShardAssignments(
 // GetShardAssignments retrieves all shard assignments for a group from etcd
 func (s *EtcdStore) GetShardAssignments(
 	ctx context.Context,
-	groupID string,
+	namespace string,
 ) (map[string]Assignment, error) {
-	prefix := s.assignmentsPrefix(groupID)
+	prefix := s.assignmentsPrefix(namespace)
 	resp, err := s.client.Get(ctx, prefix, clientv3.WithPrefix())
 	if err != nil {
 		return nil, fmt.Errorf("failed to get shard assignments: %w", err)
@@ -201,15 +201,15 @@ func (s *EtcdStore) GetShardAssignments(
 }
 
 // SaveShardGroup saves a workload group definition to etcd
-func (s *EtcdStore) SaveShardGroup(
+func (s *EtcdStore) SaveNamespace(
 	ctx context.Context,
-	groupID string,
-	data ShardGroup,
+	namespace string,
+	data Namespace,
 ) error {
-	key := s.shardGroupKey(groupID)
+	key := s.shardGroupKey(namespace)
 
-	// Ensure the GroupID in the data matches the key
-	data.GroupID = groupID
+	// Ensure the namespace in the data matches the key
+	data.Namespace = namespace
 
 	jsonData, err := json.Marshal(data)
 	if err != nil {
@@ -224,52 +224,52 @@ func (s *EtcdStore) SaveShardGroup(
 	return nil
 }
 
-// GetShardGroups retrieves all workload groups from etcd
-func (s *EtcdStore) GetShardGroups(ctx context.Context) (map[string]ShardGroup, error) {
+// GetNamespaces retrieves all workload groups from etcd
+func (s *EtcdStore) GetNamespaces(ctx context.Context) (map[string]Namespace, error) {
 	prefix := s.shardGroupsPrefix()
 	resp, err := s.client.Get(ctx, prefix, clientv3.WithPrefix())
 	if err != nil {
 		return nil, fmt.Errorf("failed to get shard groups: %w", err)
 	}
 
-	groups := make(map[string]ShardGroup)
+	groups := make(map[string]Namespace)
 	for _, kv := range resp.Kvs {
 		key := string(kv.Key)
-		// Extract groupID from the key
-		groupID := path.Base(key)
+		// Extract namespace from the key
+		namespace := path.Base(key)
 
-		var group ShardGroup
+		var group Namespace
 		if err := json.Unmarshal(kv.Value, &group); err != nil {
 			s.logger.Warn("Failed to unmarshal shard group",
-				zap.String("groupID", groupID),
+				zap.String("namespace", namespace),
 				zap.Error(err))
 			continue
 		}
 
-		groups[groupID] = group
+		groups[namespace] = group
 	}
 
 	return groups, nil
 }
 
 // GetShardGroup retrieves information about a single group from etcd
-func (s *EtcdStore) GetShardGroup(
+func (s *EtcdStore) GetNamespace(
 	ctx context.Context,
-	groupID string,
-) (ShardGroup, error) {
-	key := s.shardGroupKey(groupID)
+	namespace string,
+) (Namespace, error) {
+	key := s.shardGroupKey(namespace)
 	resp, err := s.client.Get(ctx, key)
 	if err != nil {
-		return ShardGroup{}, fmt.Errorf("failed to get shard group: %w", err)
+		return Namespace{}, fmt.Errorf("failed to get shard group: %w", err)
 	}
 
 	if len(resp.Kvs) == 0 {
-		return ShardGroup{}, fmt.Errorf("shard group not found: %s", groupID)
+		return Namespace{}, fmt.Errorf("shard group not found: %s", namespace)
 	}
 
-	var group ShardGroup
+	var group Namespace
 	if err := json.Unmarshal(resp.Kvs[0].Value, &group); err != nil {
-		return ShardGroup{}, fmt.Errorf("failed to unmarshal shard group: %w", err)
+		return Namespace{}, fmt.Errorf("failed to unmarshal shard group: %w", err)
 	}
 
 	return group, nil

@@ -3,6 +3,7 @@ package leader
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -39,6 +40,7 @@ type Election struct {
 	callback     Callback
 	stopCh       chan struct{}
 	isStopped    bool
+	prefix       string
 }
 
 // NewElection creates a new leader election manager
@@ -49,6 +51,7 @@ func NewElection(params ElectionParams) (*Election, error) {
 		electionPath: params.Config.LeaderElectionPath,
 		isLeader:     false,
 		stopCh:       make(chan struct{}),
+		prefix:       params.Config.LeaderElectionPrefix,
 	}, nil
 }
 
@@ -70,7 +73,7 @@ func (e *Election) Start(ctx context.Context) error {
 	e.mu.Lock()
 	e.session = session
 	// Create election instance
-	e.election = concurrency.NewElection(session, e.electionPath)
+	e.election = concurrency.NewElection(session, e.buildKey(e.electionPath))
 	e.mu.Unlock()
 
 	// Start campaigning for leadership
@@ -229,4 +232,9 @@ func (e *Election) SetCallback(callback Callback) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.callback = callback
+}
+
+func (e *Election) buildKey(parts ...string) string {
+	elements := append([]string{e.prefix}, parts...)
+	return strings.Join(elements, "/")
 }
