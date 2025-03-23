@@ -21,11 +21,9 @@ import (
 var (
 	serverAddr        = flag.String("server", "localhost:50051", "Server address")
 	instanceID        = flag.String("id", "", "Instance ID (defaults to hostname)")
-	capacity          = flag.Int("capacity", 100, "Instance capacity")
 	registerTimeout   = flag.Duration("register-timeout", 30*time.Second, "Registration timeout")
 	logLevel          = flag.String("log-level", "info", "Log level (debug, info, warn, error)")
 	shardTypes        = flag.String("shard-types", "default", "Comma-separated list of shard types to handle")
-	metadataFlag      = flag.String("metadata", "", "Comma-separated list of key=value metadata")
 	heartbeatInterval = flag.Duration("heartbeat", 5*time.Second, "Heartbeat interval")
 	reportInterval    = flag.Duration("report", 10*time.Second, "Health report interval")
 )
@@ -96,24 +94,6 @@ func (h *ExampleShardHandler) GetStats(shardID string) (map[string]interface{}, 
 	}, nil
 }
 
-// parseMetadata parses the metadata flag
-func parseMetadata(metadataStr string) map[string]string {
-	metadata := make(map[string]string)
-	if metadataStr == "" {
-		return metadata
-	}
-
-	pairs := strings.Split(metadataStr, ",")
-	for _, pair := range pairs {
-		kv := strings.SplitN(pair, "=", 2)
-		if len(kv) == 2 {
-			metadata[strings.TrimSpace(kv[0])] = strings.TrimSpace(kv[1])
-		}
-	}
-
-	return metadata
-}
-
 func main() {
 	flag.Parse()
 
@@ -154,18 +134,10 @@ func main() {
 		logger.Info("Using hostname as instance ID", zap.String("instanceID", id))
 	}
 
-	// Parse metadata
-	metadata := parseMetadata(*metadataFlag)
-
-	// Add workload type to metadata
-	metadata["shard_types"] = *shardTypes
-
 	// Create client service
 	svc, err := client.NewService(client.ServiceConfig{
 		ServerAddr:           *serverAddr,
 		InstanceID:           id,
-		Capacity:             int32(*capacity),
-		Metadata:             metadata,
 		HeartbeatInterval:    *heartbeatInterval,
 		HealthReportInterval: *reportInterval,
 		ShardProcessorConfig: shard.ProcessorConfig{

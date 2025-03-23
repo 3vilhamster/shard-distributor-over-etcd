@@ -1,69 +1,46 @@
 #!/bin/bash
 set -e
 
-# Build command arguments
-ARGS=""
+# Use environment variables if set, otherwise use defaults
+SERVER_ADDR=${SERVER_ADDR:-"server:50051"}
+SHARD_TYPES=${SHARD_TYPES:-"default"}
+LOG_LEVEL=${LOG_LEVEL:-"info"}
+HEARTBEAT_INTERVAL=${HEARTBEAT_INTERVAL:-5}
+REPORT_INTERVAL=${REPORT_INTERVAL:-10}
+SHUTDOWN_AFTER=${SHUTDOWN_AFTER:-0}
+GRACEFUL_SHUTDOWN=${GRACEFUL_SHUTDOWN:-false}
 
-# Set server address if provided
-if [ ! -z "$SERVER_ADDR" ]; then
-  ARGS="$ARGS --server=$SERVER_ADDR"
-fi
+# Build the command with all parameters
+CMD="/app/client"
+CMD+=" --server=${SERVER_ADDR}"
+CMD+=" --shard-types=${SHARD_TYPES}"
+CMD+=" --log-level=${LOG_LEVEL}"
+CMD+=" --heartbeat=${HEARTBEAT_INTERVAL}s"
+CMD+=" --report=${REPORT_INTERVAL}s"
 
-# Set instance ID if provided
-if [ ! -z "$INSTANCE_ID" ]; then
-  ARGS="$ARGS --id=$INSTANCE_ID"
-fi
+# Log the command
+echo "Starting client with command: $CMD"
 
-# Set capacity if provided
-if [ ! -z "$CAPACITY" ]; then
-  ARGS="$ARGS --capacity=$CAPACITY"
-fi
-
-# Set shard types if provided
-if [ ! -z "$SHARD_TYPES" ]; then
-  ARGS="$ARGS --shard-types=$SHARD_TYPES"
-fi
-
-# Set log level if provided
-if [ ! -z "$LOG_LEVEL" ]; then
-  ARGS="$ARGS --log-level=$LOG_LEVEL"
-fi
-
-# Set heartbeat interval if provided
-if [ ! -z "$HEARTBEAT_INTERVAL" ]; then
-  ARGS="$ARGS --heartbeat=${HEARTBEAT_INTERVAL}s"
-fi
-
-# Set report interval if provided
-if [ ! -z "$REPORT_INTERVAL" ]; then
-  ARGS="$ARGS --report=${REPORT_INTERVAL}s"
-fi
-
-# Set metadata if provided
-if [ ! -z "$METADATA" ]; then
-  ARGS="$ARGS --metadata=$METADATA"
-fi
-
-# Check if we need to perform graceful shutdown after a delay
-if [ ! -z "$SHUTDOWN_AFTER" ] && [ "$GRACEFUL_SHUTDOWN" = "true" ]; then
-  echo "Client will gracefully shut down after $SHUTDOWN_AFTER seconds"
-
-  # Start client in background
-  /app/client $ARGS &
-  CLIENT_PID=$!
-
-  # Set up signal forwarding
-  trap "kill -TERM $CLIENT_PID" TERM INT
+# Execute the client with all arguments
+if [ "$GRACEFUL_SHUTDOWN" = "true" ] && [ "$SHUTDOWN_AFTER" -gt 0 ]; then
+  # Start the client in the background
+  $CMD &
+  PID=$!
 
   # Wait for specified time
-  sleep "$SHUTDOWN_AFTER"
+  echo "Client started, will gracefully shutdown after ${SHUTDOWN_AFTER} seconds"
+  sleep ${SHUTDOWN_AFTER}
 
+  # Send SIGTERM for graceful shutdown
   echo "Initiating graceful shutdown..."
-  kill -TERM $CLIENT_PID
+  kill -TERM $PID
 
-  # Wait for client to exit
-  wait $CLIENT_PID
+  # Wait for client to terminate
+  wait $PID
+  exit_code=$?
+  echo "Client exited with code ${exit_code}"
+  exit $exit_code
 else
-  # Start client normally
-  exec /app/client $ARGS
+  # Start the client in the foreground
+  exec $CMD
 fi

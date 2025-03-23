@@ -110,7 +110,6 @@ func NewManager(serverAddr, instanceID string, instanceInfo *proto.InstanceInfo,
 		instanceInfo:      instanceInfo,
 		heartbeatInterval: DefaultHeartbeatInterval,
 		reconnectCh:       make(chan struct{}, 1),
-		handlers:          make(map[proto.ServerMessage_MessageType][]ServerMessageHandler),
 		logger:            zap.NewNop(),
 		reconnectBackoff: backoff.Config{
 			BaseDelay:  DefaultReconnectBackoff,
@@ -120,6 +119,15 @@ func NewManager(serverAddr, instanceID string, instanceInfo *proto.InstanceInfo,
 		},
 		ctx:    ctx,
 		cancel: cancel,
+	}
+
+	m.handlers = map[proto.ServerMessage_MessageType][]ServerMessageHandler{
+		proto.ServerMessage_REGISTER_RESPONSE: {m.handleRegisterResponse},
+		proto.ServerMessage_HEARTBEAT_ACK: {func(ctx context.Context, message *proto.ServerMessage) error {
+			// Just log at debug level
+			m.logger.Debug("Received heartbeat acknowledgment")
+			return nil
+		}},
 	}
 
 	// Apply options
@@ -154,7 +162,7 @@ func (m *Manager) Connect(ctx context.Context) error {
 	}
 
 	// Create gRPC connection
-	conn, err := grpc.DialContext(ctx, m.serverAddr, opts...)
+	conn, err := grpc.NewClient(m.serverAddr, opts...)
 	if err != nil {
 		m.logger.Error("Failed to connect to server",
 			zap.String("server", m.serverAddr),
@@ -267,13 +275,6 @@ func (m *Manager) Deregister(ctx context.Context) error {
 
 // StartWatching starts watching for shard assignments
 func (m *Manager) StartWatching(ctx context.Context) error {
-	m.mutex.RLock()
-	defer m.mutex.RUnlock()
-
-	if !m.isRegistered {
-		return errors.New("instance not registered")
-	}
-
 	m.logger.Info("Starting to watch for shard assignments")
 
 	// Prepare watch message
@@ -479,16 +480,6 @@ func (m *Manager) handleServerMessage(msg *proto.ServerMessage) error {
 	handlers := m.handlers[msg.Type]
 	m.mutex.RUnlock()
 
-	// Handle special messages internally
-	switch msg.Type {
-	case proto.ServerMessage_REGISTER_RESPONSE:
-		m.handleRegisterResponse(msg)
-	case proto.ServerMessage_HEARTBEAT_ACK:
-		// Just log at debug level
-		m.logger.Debug("Received heartbeat acknowledgment")
-		return nil
-	}
-
 	// Call registered handlers
 	ctx := context.Background()
 	for _, handler := range handlers {
@@ -503,14 +494,14 @@ func (m *Manager) handleServerMessage(msg *proto.ServerMessage) error {
 }
 
 // handleRegisterResponse processes registration response
-func (m *Manager) handleRegisterResponse(msg *proto.ServerMessage) {
+func (m *Manager) handleRegisterResponse(ctx context.Context, msg *proto.ServerMessage) error {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
 	if !msg.Success {
 		m.logger.Error("Registration failed",
 			zap.String("reason", msg.Message))
-		return
+		return fmt.Errorf("registration failed: %s", msg.Message)
 	}
 
 	m.isRegistered = true
@@ -525,6 +516,7 @@ func (m *Manager) handleRegisterResponse(msg *proto.ServerMessage) {
 	if m.onRegistered != nil {
 		go m.onRegistered(msg.AssignedShards)
 	}
+	return nil
 }
 
 // startHeartbeat starts the heartbeat ticker
@@ -573,7 +565,7 @@ func (m *Manager) triggerReconnect() {
 
 // monitorConnectionState monitors the connection state and handles reconnection
 func (m *Manager) monitorConnectionState() {
-	var lastState connectivity.State = connectivity.Idle
+	var lastState = connectivity.Idle
 	for {
 		if m.isShutdown {
 			return

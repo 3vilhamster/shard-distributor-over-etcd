@@ -42,14 +42,16 @@ echo "=== Building the application ==="
 go build -o shard-distributor cmd/poc/poc.go
 
 echo "=== Running the server ==="
-./shard-distributor -mode=server -shards=10 &
+go build -o .bin/server cmd/distributor/server/main.go
+.bin/server &
 SERVER_PID=$!
 
 echo "Waiting for server to initialize..."
 sleep 2
 
 echo "=== Starting client instances ==="
-./shard-distributor -mode=client -id=instance -clients=3 -duration=30s -failover=true &
+go build -o .bin/client cmd/distributor/client/main.go
+.bin/client &
 CLIENT_PID=$!
 
 echo "=== Test running. Use these commands to inspect state: ==="

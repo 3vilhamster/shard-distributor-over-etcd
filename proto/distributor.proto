@@ -70,8 +70,6 @@ enum ShardAssignmentAction {
 // Keep these for backward compatibility or reference
 message InstanceInfo {
   string instance_id = 1;
-  int32 capacity = 2;
-  map<string, string> metadata = 3;
 }
 
 message StatusReport {

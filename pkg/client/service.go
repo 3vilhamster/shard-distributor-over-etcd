@@ -22,12 +22,6 @@ type ServiceConfig struct {
 	// InstanceID is the unique identifier for this instance
 	InstanceID string
 
-	// Capacity is the maximum capacity of this instance
-	Capacity int32
-
-	// Metadata contains additional information about this instance
-	Metadata map[string]string
-
 	// ReconnectBackoff is the base time to wait before reconnecting
 	ReconnectBackoff time.Duration
 
@@ -112,8 +106,6 @@ func NewService(config ServiceConfig, logger *zap.Logger) (*Service, error) {
 	// Create instance info
 	instanceInfo := &proto.InstanceInfo{
 		InstanceId: config.InstanceID,
-		Capacity:   config.Capacity,
-		Metadata:   config.Metadata,
 	}
 
 	// Create connection manager
