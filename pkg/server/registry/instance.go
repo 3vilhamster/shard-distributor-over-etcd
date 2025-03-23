@@ -1,0 +1,133 @@
+package registry
+
+import (
+	"time"
+
+	"github.com/jonboulle/clockwork"
+	clientv3 "go.etcd.io/etcd/client/v3"
+
+	"github.com/3vilhamster/shard-distributor-over-etcd/gen/proto"
+)
+
+// InstanceData contains information about a service instance
+type InstanceData struct {
+	// Basic instance information
+	InstanceID string
+	Info       *proto.InstanceInfo
+	Status     *proto.StatusReport
+	Endpoint   string
+
+	// Resource management
+	LeaseID       clientv3.LeaseID
+	LastHeartbeat time.Time
+
+	// Communication streams
+	Streams []proto.ShardDistributor_ShardDistributorStreamServer
+
+	// Stats and metrics
+	Stats InstanceStats
+
+	// clock for time operations (for testability)
+	clock clockwork.Clock
+}
+
+// InstanceStats contains operational statistics for an instance
+type InstanceStats struct {
+	// Connection stats
+	ConnectedAt      time.Time
+	LastDisconnectAt time.Time
+	ReconnectCount   int
+
+	// Performance metrics
+	AverageLatency time.Duration
+	PeakLoad       float64
+
+	// Shard handling stats
+	TotalShardsHandled   int
+	CurrentActiveShards  int
+	CurrentStandbyShards int
+}
+
+// NewInstanceData creates a new instance data object
+func NewInstanceData(
+	instanceID string,
+	info *proto.InstanceInfo,
+	endpoint string,
+	leaseID clientv3.LeaseID,
+	clock clockwork.Clock,
+) *InstanceData {
+	now := clock.Now()
+
+	return &InstanceData{
+		InstanceID: instanceID,
+		Info:       info,
+		Status: &proto.StatusReport{
+			InstanceId: instanceID,
+			Status:     proto.StatusReport_ACTIVE,
+		},
+		Endpoint:      endpoint,
+		LeaseID:       leaseID,
+		LastHeartbeat: now,
+		Streams:       make([]proto.ShardDistributor_ShardDistributorStreamServer, 0),
+		Stats: InstanceStats{
+			ConnectedAt: now,
+		},
+		clock: clock,
+	}
+}
+
+// AddStream adds a new stream to the instance
+func (i *InstanceData) AddStream(stream proto.ShardDistributor_ShardDistributorStreamServer) {
+	i.Streams = append(i.Streams, stream)
+}
+
+// RemoveStream removes a stream from the instance
+func (i *InstanceData) RemoveStream(stream proto.ShardDistributor_ShardDistributorStreamServer) bool {
+	for idx, s := range i.Streams {
+		if s == stream {
+			// Remove this stream by replacing with the last element and truncating
+			lastIdx := len(i.Streams) - 1
+			if idx < lastIdx {
+				i.Streams[idx] = i.Streams[lastIdx]
+			}
+			i.Streams = i.Streams[:lastIdx]
+			return true
+		}
+	}
+	return false
+}
+
+// GetStreamCount returns the number of active streams
+func (i *InstanceData) GetStreamCount() int {
+	return len(i.Streams)
+}
+
+// UpdateHeartbeat updates the heartbeat timestamp
+func (i *InstanceData) UpdateHeartbeat() {
+	i.LastHeartbeat = i.clock.Now()
+}
+
+// UpdateStatus updates the instance status
+func (i *InstanceData) UpdateStatus(status *proto.StatusReport) {
+	i.Status = status
+	i.UpdateHeartbeat()
+
+	// Update stats
+	i.Stats.CurrentActiveShards = int(status.ActiveShardCount)
+	i.Stats.CurrentStandbyShards = int(status.StandbyShardCount)
+}
+
+// IsDraining returns whether the instance is in draining state
+func (i *InstanceData) IsDraining() bool {
+	return i.Status.Status == proto.StatusReport_DRAINING
+}
+
+// IsOverloaded returns whether the instance is overloaded
+func (i *InstanceData) IsOverloaded() bool {
+	return i.Status.Status == proto.StatusReport_OVERLOADED
+}
+
+// TimeSinceHeartbeat returns the duration since the last heartbeat
+func (i *InstanceData) TimeSinceHeartbeat() time.Duration {
+	return i.clock.Now().Sub(i.LastHeartbeat)
+}

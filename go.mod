@@ -4,8 +4,10 @@ go 1.24
 
 require (
 	github.com/dgryski/go-farm v0.0.0-20240924180020-3414d57e47da
+	github.com/jonboulle/clockwork v0.5.0
 	go.etcd.io/etcd/client/v3 v3.5.9
-	go.uber.org/zap v1.17.0
+	go.uber.org/fx v1.23.0
+	go.uber.org/zap v1.26.0
 	google.golang.org/grpc v1.70.0
 	google.golang.org/protobuf v1.36.5
 )
@@ -17,8 +19,8 @@ require (
 	github.com/golang/protobuf v1.5.4 // indirect
 	go.etcd.io/etcd/api/v3 v3.5.9 // indirect
 	go.etcd.io/etcd/client/pkg/v3 v3.5.9 // indirect
-	go.uber.org/atomic v1.7.0 // indirect
-	go.uber.org/multierr v1.6.0 // indirect
+	go.uber.org/dig v1.18.0 // indirect
+	go.uber.org/multierr v1.10.0 // indirect
 	golang.org/x/net v0.37.0 // indirect
 	golang.org/x/sys v0.31.0 // indirect
 	golang.org/x/text v0.23.0 // indirect

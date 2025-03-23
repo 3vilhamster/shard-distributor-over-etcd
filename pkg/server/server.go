@@ -17,11 +17,11 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/3vilhamster/shard-distributor-over-etcd/gen/proto"
-	"github.com/3vilhamster/shard-distributor-over-etcd/pkg/sharding"
+	distribution2 "github.com/3vilhamster/shard-distributor-over-etcd/pkg/server/distribution"
 )
 
 type Distributor interface {
-	CalculateDistribution(currentMap map[string]string, instances map[string]sharding.InstanceInfo) map[string]string
+	CalculateDistribution(currentMap map[string]string, instances map[string]distribution2.InstanceInfo) map[string]string
 }
 
 // ShardDistributorServer implements the ShardDistributor gRPC service
@@ -106,7 +106,7 @@ func NewShardDistributorServer(logger *zap.Logger, etcdClient *clientv3.Client) 
 		instanceStreams:  make(map[string][]proto.ShardDistributor_ShardDistributorStreamServer),
 		instances:        make(map[string]*InstanceData),
 		shardAssignments: make(map[string]string),
-		hashStrategy:     sharding.NewConsistentHashStrategy(10), // Use consistent hashing with 10 virtual nodes
+		hashStrategy:     distribution2.NewConsistentHashStrategy(10), // Use consistent hashing with 10 virtual nodes
 		election:         election,
 		leaderChan:       make(chan bool, 1),
 		session:          session,
@@ -995,14 +995,14 @@ func (s *ShardDistributorServer) recalculateShardDistribution() {
 	s.logger.Debug("Available instances", zap.Strings("instance_ids", instanceIDs))
 
 	// Convert instances to the format needed by the hash strategy
-	activeInstances := make(map[string]sharding.InstanceInfo)
+	activeInstances := make(map[string]distribution2.InstanceInfo)
 	for id, instance := range s.instances {
 		status := "active"
 		if instance.Status.Status == proto.StatusReport_DRAINING {
 			status = "draining"
 		}
 
-		activeInstances[id] = sharding.InstanceInfo{
+		activeInstances[id] = distribution2.InstanceInfo{
 			ID:         id,
 			Status:     status,
 			LoadFactor: instance.Status.CpuUsage,

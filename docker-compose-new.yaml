@@ -1,0 +1,195 @@
+version: '3.8'
+
+services:
+  # etcd cluster
+  etcd1:
+    image: quay.io/coreos/etcd:v3.5.0
+    environment:
+      - ETCD_NAME=etcd1
+      - ETCD_INITIAL_ADVERTISE_PEER_URLS=http://etcd1:2380
+      - ETCD_LISTEN_PEER_URLS=http://0.0.0.0:2380
+      - ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379
+      - ETCD_ADVERTISE_CLIENT_URLS=http://etcd1:2379
+      - ETCD_INITIAL_CLUSTER=etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+      - ETCD_INITIAL_CLUSTER_STATE=new
+      - ETCD_INITIAL_CLUSTER_TOKEN=etcd-cluster-1
+    ports:
+      - "2379:2379"
+    networks:
+      - shard-distributor-net
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  etcd2:
+    image: quay.io/coreos/etcd:v3.5.0
+    environment:
+      - ETCD_NAME=etcd2
+      - ETCD_INITIAL_ADVERTISE_PEER_URLS=http://etcd2:2380
+      - ETCD_LISTEN_PEER_URLS=http://0.0.0.0:2380
+      - ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379
+      - ETCD_ADVERTISE_CLIENT_URLS=http://etcd2:2379
+      - ETCD_INITIAL_CLUSTER=etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+      - ETCD_INITIAL_CLUSTER_STATE=new
+      - ETCD_INITIAL_CLUSTER_TOKEN=etcd-cluster-1
+    networks:
+      - shard-distributor-net
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  etcd3:
+    image: quay.io/coreos/etcd:v3.5.0
+    environment:
+      - ETCD_NAME=etcd3
+      - ETCD_INITIAL_ADVERTISE_PEER_URLS=http://etcd3:2380
+      - ETCD_LISTEN_PEER_URLS=http://0.0.0.0:2380
+      - ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379
+      - ETCD_ADVERTISE_CLIENT_URLS=http://etcd3:2379
+      - ETCD_INITIAL_CLUSTER=etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+      - ETCD_INITIAL_CLUSTER_STATE=new
+      - ETCD_INITIAL_CLUSTER_TOKEN=etcd-cluster-1
+    networks:
+      - shard-distributor-net
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    command:
+      - "--server=:50051"
+      - "--etcd=etcd1:2379,etcd2:2379,etcd3:2379"
+      - "--log-level=${LOG_LEVEL:-debug}"
+      - "--reconcile-interval=${RECONCILE_INTERVAL:-15s}"
+      - "--health-interval=${HEALTH_INTERVAL:-5s}"
+      - "--leader-path=/shard-distributor/leader"
+      - "--strategy=farmHash"
+      - "--health-port=8080"
+    ports:
+      - "50051-50053:50051"
+    depends_on:
+      etcd1:
+        condition: service_healthy
+      etcd2:
+        condition: service_healthy
+      etcd3:
+        condition: service_healthy
+    networks:
+      - shard-distributor-net
+    healthcheck:
+      # Use HTTP health endpoint instead of grpc_health_probe
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      replicas: 3
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+
+  # Client instances for type1 shards
+  client-type1:
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+    command:
+      - "--server=server:50051"
+      - "--shard-types=type1"
+      - "--capacity=10"
+      - "--log-level=debug"
+      - "--heartbeat=5s"
+      - "--report=10s"
+      - "--metadata=group=type1,zone=zone1"
+    depends_on:
+      server:
+        condition: service_healthy
+    networks:
+      - shard-distributor-net
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: '0.3'
+          memory: 256M
+
+  # Client instances for type2 shards
+  client-type2:
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+    command:
+      - "--server=server:50051"
+      - "--shard-types=type2"
+      - "--capacity=10"
+      - "--log-level=debug"
+      - "--heartbeat=5s"
+      - "--report=10s"
+      - "--metadata=group=type2,zone=zone1"
+    depends_on:
+      server:
+        condition: service_healthy
+    networks:
+      - shard-distributor-net
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: '0.3'
+          memory: 256M
+
+  # Shard generator to create test shards
+  shard-generator:
+    build:
+      context: .
+      dockerfile: Dockerfile.generator
+    environment:
+      - ETCD_ENDPOINTS=etcd1:2379
+      - NUM_TYPE1_SHARDS=20
+      - NUM_TYPE2_SHARDS=20
+      - BATCH_SIZE=5
+      - INTERVAL_MS=1000
+    depends_on:
+      etcd1:
+        condition: service_healthy
+    networks:
+      - shard-distributor-net
+
+  # Client with graceful shutdown for testing
+  graceful-shutdown-client:
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+    environment:
+      - SERVER_ADDR=server:50051
+      - SHARD_TYPES=type1,type2
+      - CAPACITY=20
+      - LOG_LEVEL=debug
+      - HEARTBEAT_INTERVAL=5
+      - REPORT_INTERVAL=10
+      - METADATA=group=mixed,zone=zone3
+      - SHUTDOWN_AFTER=60
+      - GRACEFUL_SHUTDOWN=true
+    depends_on:
+      server:
+        condition: service_healthy
+    networks:
+      - shard-distributor-net
+
+networks:
+  shard-distributor-net:
+    driver: bridge

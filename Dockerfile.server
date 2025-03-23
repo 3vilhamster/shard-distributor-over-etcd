@@ -1,0 +1,37 @@
+FROM golang:1.24-alpine AS builder
+
+WORKDIR /app
+
+# Install build dependencies
+RUN apk add --no-cache git gcc musl-dev
+
+# Copy go.mod and go.sum files
+COPY go.mod go.sum ./
+
+# Download dependencies
+RUN go mod download
+
+# Copy the source code
+COPY . .
+
+# Build the server binary
+RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o server ./cmd/distributor/server/main.go
+
+# Final lightweight image
+FROM alpine:3.18
+
+RUN apk add --no-cache ca-certificates tzdata wget
+
+WORKDIR /app
+
+# Copy the binary from the builder stage
+COPY --from=builder /app/server .
+
+# Expose the gRPC port and health check port
+EXPOSE 50051 8080
+
+# Set entrypoint with correct flags
+ENTRYPOINT ["/app/server"]
+
+# Default arguments (these will be overridden by Docker Compose environment variables)
+CMD ["--server=:50051", "--etcd=etcd1:2379"]

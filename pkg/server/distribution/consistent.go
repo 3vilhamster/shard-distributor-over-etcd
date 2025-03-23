@@ -1,4 +1,4 @@
-package sharding
+package distribution
 
 import (
 	"hash/fnv"
@@ -135,6 +135,10 @@ func NewConsistentHashStrategy(virtualNodes int) *ConsistentHashStrategy {
 	}
 }
 
+func (s *ConsistentHashStrategy) Name() string {
+	return "ConsistentHashRing"
+}
+
 // CalculateDistribution determines optimal shard placement using consistent hashing
 func (s *ConsistentHashStrategy) CalculateDistribution(
 	currentMap map[string]string,
@@ -162,12 +166,4 @@ func (s *ConsistentHashStrategy) CalculateDistribution(
 	}
 
 	return distribution
-}
-
-// InstanceInfo contains information about a service instance
-type InstanceInfo struct {
-	ID         string
-	Status     string
-	LoadFactor float64
-	ShardCount int
 }

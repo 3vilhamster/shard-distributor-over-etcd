@@ -1,19 +1,23 @@
-package sharding
+package distribution
 
 import (
 	"github.com/dgryski/go-farm" // Import the farmhash library
 )
 
-// SimpleHashDistributor provides a straightforward hash-based distribution
-type SimpleHashDistributor struct{}
+// FarmHashDistributor provides a straightforward hash-based distribution
+type FarmHashDistributor struct{}
 
-// NewSimpleHashDistributor creates a new simple hash-based distributor
-func NewSimpleHashDistributor() *SimpleHashDistributor {
-	return &SimpleHashDistributor{}
+// NewFarmHashStrategy creates a new simple hash-based distributor
+func NewFarmHashStrategy() *FarmHashDistributor {
+	return &FarmHashDistributor{}
+}
+
+func (d *FarmHashDistributor) Name() string {
+	return "FarmHash"
 }
 
 // CalculateDistribution determines shard placement using simple hash distribution
-func (d *SimpleHashDistributor) CalculateDistribution(
+func (d *FarmHashDistributor) CalculateDistribution(
 	currentMap map[string]string,
 	instances map[string]InstanceInfo,
 ) map[string]string {

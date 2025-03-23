@@ -1,0 +1,31 @@
+FROM golang:1.24-alpine AS builder
+
+WORKDIR /app
+
+# Install build dependencies
+RUN apk add --no-cache git gcc musl-dev
+
+# Copy go.mod and go.sum files
+COPY go.mod go.sum ./
+
+# Download dependencies
+RUN go mod download
+
+# Copy the source code
+COPY . .
+
+# Build the shard generator binary
+RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o generator ./tools/shard-generator/main.go
+
+# Final lightweight image
+FROM alpine:3.18
+
+RUN apk add --no-cache ca-certificates tzdata
+
+WORKDIR /app
+
+# Copy the binary from the builder stage
+COPY --from=builder /app/generator .
+
+# Set entrypoint
+ENTRYPOINT ["/app/generator"]
