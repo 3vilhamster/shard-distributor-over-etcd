@@ -1,6 +1,9 @@
 #!/bin/bash
 # This script helps debug and run the Shard Distributor PoC
 
+trap 'kill
+ ${SERVER_PID} ${CLIENT_PID}; exit 1' INT
+
 # Set up logging for easier debugging
 export ETCDCTL_API=3
 
@@ -62,7 +65,4 @@ echo "etcdctl get --prefix /shard-distributor # Show leader info"
 echo "=== Logs will appear below. Press Ctrl+C to stop the test ==="
 wait $CLIENT_PID
 
-echo "=== Test complete. Cleaning up ==="
-kill $SERVER_PID
-echo "You can stop the etcd container with: docker stop etcd-server"
-echo "You can remove the etcd container with: docker rm etcd-server"
+wait
