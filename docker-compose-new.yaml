@@ -34,7 +34,6 @@ services:
       - "--health-interval=${HEALTH_INTERVAL:-5s}"
       - "--leader-path=/shard-distributor/leader"
       - "--strategy=farmHash"
-      - "--health-port=8080"
     ports:
       - "50051-50053:50051"
     depends_on:
@@ -44,7 +43,7 @@ services:
       - shard-distributor-net
     healthcheck:
       # Use HTTP health endpoint instead of grpc_health_probe
-      test: ["CMD", "/bin/grpc_health_probe", "-addr=:5000"]
+      test: ["CMD", "/bin/grpc_health_probe", "-addr=:50051"]
 #      interval: 10s
 #      timeout: 5s
 #      retries: 3
