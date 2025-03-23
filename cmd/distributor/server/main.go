@@ -149,7 +149,7 @@ func main() {
 		fx.Provide(server.NewService),
 
 		// Invoke functions to start the application
-		fx.Invoke(func(logger *zap.Logger, service *server.Service, etcdStore *store.EtcdStore) {
+		fx.Invoke(func(logger *zap.Logger, service *server.Service, etcdStore store.Store) {
 			logger.Info("Shard distributor server initialized",
 				zap.String("etcd", *etcdAddr),
 				zap.Any("store", etcdStore),

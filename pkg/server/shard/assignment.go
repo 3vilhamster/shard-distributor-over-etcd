@@ -2,7 +2,6 @@ package shard
 
 import (
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/jonboulle/clockwork"
@@ -22,8 +21,8 @@ const (
 	StatePreparing
 )
 
-// ShardAssignment represents an individual shard assignment
-type ShardAssignment struct {
+// Assignment represents an individual shard assignment
+type Assignment struct {
 	ShardID           string
 	GroupID           string
 	InstanceID        string
@@ -37,8 +36,8 @@ type ShardAssignment struct {
 }
 
 // NewAssignment creates a new shard assignment
-func NewAssignment(shardID, groupID string, clock clockwork.Clock) *ShardAssignment {
-	return &ShardAssignment{
+func NewAssignment(shardID, groupID string, clock clockwork.Clock) *Assignment {
+	return &Assignment{
 		ShardID:           shardID,
 		GroupID:           groupID,
 		State:             StateUnassigned,
@@ -48,7 +47,7 @@ func NewAssignment(shardID, groupID string, clock clockwork.Clock) *ShardAssignm
 }
 
 // Assign assigns the shard to an instance
-func (a *ShardAssignment) Assign(instanceID string, version int64, clock clockwork.Clock) {
+func (a *Assignment) Assign(instanceID string, version int64, clock clockwork.Clock) {
 	a.PreviousInstance = a.InstanceID
 	a.InstanceID = instanceID
 	a.State = StateAssigned
@@ -57,7 +56,7 @@ func (a *ShardAssignment) Assign(instanceID string, version int64, clock clockwo
 }
 
 // BeginTransfer starts the transfer of the shard to a new instance
-func (a *ShardAssignment) BeginTransfer(targetInstance string, clock clockwork.Clock) {
+func (a *Assignment) BeginTransfer(targetInstance string, clock clockwork.Clock) {
 	a.PreviousInstance = a.InstanceID
 	a.InstanceID = targetInstance
 	a.State = StateTransferring
@@ -65,7 +64,7 @@ func (a *ShardAssignment) BeginTransfer(targetInstance string, clock clockwork.C
 }
 
 // MarkPrepared marks an instance as prepared for this shard
-func (a *ShardAssignment) MarkPrepared(instanceID string) {
+func (a *Assignment) MarkPrepared(instanceID string) {
 	// Check if already in the list
 	for _, id := range a.PreparedInstances {
 		if id == instanceID {
@@ -77,7 +76,7 @@ func (a *ShardAssignment) MarkPrepared(instanceID string) {
 }
 
 // IsPrepared checks if an instance is prepared for this shard
-func (a *ShardAssignment) IsPrepared(instanceID string) bool {
+func (a *Assignment) IsPrepared(instanceID string) bool {
 	for _, id := range a.PreparedInstances {
 		if id == instanceID {
 			return true
@@ -87,19 +86,19 @@ func (a *ShardAssignment) IsPrepared(instanceID string) bool {
 }
 
 // Unassign removes the instance assignment
-func (a *ShardAssignment) Unassign() {
+func (a *Assignment) Unassign() {
 	a.PreviousInstance = a.InstanceID
 	a.InstanceID = ""
 	a.State = StateUnassigned
 }
 
 // UpdateHeartbeat updates the heartbeat timestamp
-func (a *ShardAssignment) UpdateHeartbeat(clock clockwork.Clock) {
+func (a *Assignment) UpdateHeartbeat(clock clockwork.Clock) {
 	a.LastHeartbeatAt = clock.Now()
 }
 
 // TransferDuration returns the duration of the current transfer
-func (a *ShardAssignment) TransferDuration(clock clockwork.Clock) time.Duration {
+func (a *Assignment) TransferDuration(clock clockwork.Clock) time.Duration {
 	if a.State != StateTransferring || a.TransferStartedAt.IsZero() {
 		return 0
 	}
@@ -107,7 +106,7 @@ func (a *ShardAssignment) TransferDuration(clock clockwork.Clock) time.Duration 
 }
 
 // AssignmentAge returns the age of the current assignment
-func (a *ShardAssignment) AssignmentAge(clock clockwork.Clock) time.Duration {
+func (a *Assignment) AssignmentAge(clock clockwork.Clock) time.Duration {
 	if a.AssignedAt.IsZero() {
 		return 0
 	}
@@ -115,7 +114,7 @@ func (a *ShardAssignment) AssignmentAge(clock clockwork.Clock) time.Duration {
 }
 
 // String returns a string representation of the assignment
-func (a *ShardAssignment) String() string {
+func (a *Assignment) String() string {
 	var state string
 	switch a.State {
 	case StateUnassigned:
@@ -134,12 +133,6 @@ func (a *ShardAssignment) String() string {
 		"Shard: %s, Group: %s, Instance: %s, State: %s, Version: %d",
 		a.ShardID, a.GroupID, a.InstanceID, state, a.Version,
 	)
-}
-
-// ShardNotifier handles notifying instances about shard changes
-type ShardNotifier struct {
-	logger *zap.Logger
-	mu     sync.RWMutex
 }
 
 // NewShardNotifier creates a new shard notifier

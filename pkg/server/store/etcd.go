@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/fx"
@@ -13,19 +15,18 @@ import (
 
 // Constants for etcd paths
 const (
-	InstancesPrefix      = "/services/"
-	ShardsPrefix         = "/shards/"
-	ShardVersionsPrefix  = "/shard-versions/"
-	GlobalVersionKey     = "/shard-distributor/global-version"
-	WorkloadGroupsPrefix = "/workload-groups/"
+	InstancesPrefix     = "/services/"
+	ShardsPrefix        = "/shards/"
+	ShardVersionsPrefix = "/shard-versions/"
+	GlobalVersionKey    = "/shard-distributor/global-version"
+	ShardGroupsPrefix   = "/shard-groups/"
 )
 
 // EtcdStore provides storage using etcd
 type EtcdStore struct {
-	client  clientv3.KV
-	watcher clientv3.Watcher
-	leaser  clientv3.Lease
-	logger  *zap.Logger
+	client        *clientv3.Client
+	logger        *zap.Logger
+	activeWatches sync.Map // Store active watch contexts for clean shutdown
 }
 
 // EtcdStoreParams defines dependencies for creating an EtcdStore
@@ -37,25 +38,30 @@ type EtcdStoreParams struct {
 }
 
 // NewEtcdStore creates a new etcd store
-func NewEtcdStore(params EtcdStoreParams) (*EtcdStore, error) {
+func NewEtcdStore(params EtcdStoreParams) (Store, error) {
 	params.Logger.Info("Creating new etcd store")
 
-	// check etcd
+	// check etcd connectivity
 	endpoints := params.Client.Endpoints()
 	for _, endpoint := range endpoints {
-		st, err := params.Client.Status(context.Background(), endpoint)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		st, err := params.Client.Status(ctx, endpoint)
+		cancel()
+
 		if err != nil {
-			params.Logger.Warn("Failed to connect to etcd", zap.String("endpoint", endpoint), zap.Error(err))
-			return nil, err
+			params.Logger.Warn("Failed to connect to etcd",
+				zap.String("endpoint", endpoint),
+				zap.Error(err))
+			return nil, fmt.Errorf("failed to connect to etcd endpoint %s: %w", endpoint, err)
 		}
-		params.Logger.Info("etcd status", zap.String("endpoint", endpoint), zap.Any("status", st))
+		params.Logger.Info("Connected to etcd endpoint",
+			zap.String("endpoint", endpoint),
+			zap.String("version", st.Version))
 	}
 
 	return &EtcdStore{
-		client:  params.Client,
-		watcher: params.Client,
-		leaser:  params.Client,
-		logger:  params.Logger,
+		client: params.Client,
+		logger: params.Logger,
 	}, nil
 }
 
@@ -228,12 +234,10 @@ func (s *EtcdStore) IncrementGlobalVersion(ctx context.Context) (int64, error) {
 
 // InitializeGlobalVersion initializes the global version in etcd if it doesn't exist
 func (s *EtcdStore) InitializeGlobalVersion(ctx context.Context) error {
-	s.logger.Info("Attempting to initialize global version")
+	s.logger.Info("Initializing global version if not exists")
 
 	// Use a transaction for atomic check-and-set
 	txn := s.client.Txn(ctx)
-
-	s.logger.Info("started tx")
 
 	// If the key doesn't exist
 	txn = txn.If(clientv3.Compare(clientv3.CreateRevision(GlobalVersionKey), "=", 0))
@@ -244,16 +248,12 @@ func (s *EtcdStore) InitializeGlobalVersion(ctx context.Context) error {
 	// Otherwise do nothing
 	txn = txn.Else()
 
-	s.logger.Info("committing")
-
 	// Execute the transaction
 	txnResp, err := txn.Commit()
 	if err != nil {
 		s.logger.Warn("Failed to initialize global version", zap.Error(err))
-		return err
+		return fmt.Errorf("failed to initialize global version: %w", err)
 	}
-
-	s.logger.Info("resp", zap.Any("resp", txnResp))
 
 	if txnResp.Succeeded {
 		s.logger.Info("Initialized global version to 0")
@@ -273,7 +273,7 @@ func (s *EtcdStore) InitializeGlobalVersion(ctx context.Context) error {
 
 // SaveShardGroup saves a workload group definition to etcd
 func (s *EtcdStore) SaveShardGroup(ctx context.Context, groupID string, data string) error {
-	key := WorkloadGroupsPrefix + groupID
+	key := ShardGroupsPrefix + groupID
 
 	_, err := s.client.Put(ctx, key, data)
 	if err != nil {
@@ -285,7 +285,7 @@ func (s *EtcdStore) SaveShardGroup(ctx context.Context, groupID string, data str
 
 // GetShardGroups retrieves all workload groups from etcd
 func (s *EtcdStore) GetShardGroups(ctx context.Context) (map[string]string, error) {
-	resp, err := s.client.Get(ctx, WorkloadGroupsPrefix, clientv3.WithPrefix())
+	resp, err := s.client.Get(ctx, ShardGroupsPrefix, clientv3.WithPrefix())
 	if err != nil {
 		return nil, fmt.Errorf("failed to get shard groups: %w", err)
 	}
@@ -293,7 +293,7 @@ func (s *EtcdStore) GetShardGroups(ctx context.Context) (map[string]string, erro
 	groups := make(map[string]string)
 	for _, kv := range resp.Kvs {
 		key := string(kv.Key)
-		groupID := strings.TrimPrefix(key, WorkloadGroupsPrefix)
+		groupID := strings.TrimPrefix(key, ShardGroupsPrefix)
 		data := string(kv.Value)
 		groups[groupID] = data
 	}
@@ -303,7 +303,7 @@ func (s *EtcdStore) GetShardGroups(ctx context.Context) (map[string]string, erro
 
 // DeleteShardGroup removes a workload group definition
 func (s *EtcdStore) DeleteShardGroup(ctx context.Context, groupID string) error {
-	key := WorkloadGroupsPrefix + groupID
+	key := ShardGroupsPrefix + groupID
 	_, err := s.client.Delete(ctx, key)
 	if err != nil {
 		return fmt.Errorf("failed to delete shard group: %w", err)
@@ -312,45 +312,117 @@ func (s *EtcdStore) DeleteShardGroup(ctx context.Context, groupID string) error 
 }
 
 // WatchInstances sets up a watch for instance changes
-func (s *EtcdStore) WatchInstances(ctx context.Context) clientv3.WatchChan {
-	return s.watcher.Watch(ctx, InstancesPrefix, clientv3.WithPrefix())
+func (s *EtcdStore) WatchInstances(ctx context.Context, callback WatchCallback) (CancelFunc, error) {
+	return s.setupWatch(ctx, InstancesPrefix, true, func(event WatchEvent) {
+		// Extract instanceID from key
+		event.Key = strings.TrimPrefix(event.Key, InstancesPrefix)
+		callback(event)
+	})
 }
 
 // WatchShardAssignments sets up a watch for shard assignment changes
-func (s *EtcdStore) WatchShardAssignments(ctx context.Context) clientv3.WatchChan {
-	return s.watcher.Watch(ctx, ShardsPrefix, clientv3.WithPrefix())
+func (s *EtcdStore) WatchShardAssignments(ctx context.Context, callback WatchCallback) (CancelFunc, error) {
+	return s.setupWatch(ctx, ShardsPrefix, true, func(event WatchEvent) {
+		// Extract shardID from key
+		event.Key = strings.TrimPrefix(event.Key, ShardsPrefix)
+		callback(event)
+	})
 }
 
 // WatchGlobalVersion sets up a watch for global version changes
-func (s *EtcdStore) WatchGlobalVersion(ctx context.Context) clientv3.WatchChan {
-	return s.watcher.Watch(ctx, GlobalVersionKey)
+func (s *EtcdStore) WatchGlobalVersion(ctx context.Context, callback WatchCallback) (CancelFunc, error) {
+	return s.setupWatch(ctx, GlobalVersionKey, false, callback)
 }
 
 // WatchShardGroup sets up a watch for a specific shard group
-func (s *EtcdStore) WatchShardGroup(ctx context.Context, groupID string) clientv3.WatchChan {
-	key := WorkloadGroupsPrefix + groupID
-	return s.watcher.Watch(ctx, key)
+func (s *EtcdStore) WatchShardGroup(ctx context.Context, groupID string, callback WatchCallback) (CancelFunc, error) {
+	key := ShardGroupsPrefix + groupID
+	return s.setupWatch(ctx, key, false, func(event WatchEvent) {
+		// Extract groupID from key
+		event.Key = strings.TrimPrefix(event.Key, ShardGroupsPrefix)
+		callback(event)
+	})
 }
 
-// BatchOperation performs multiple operations in a single transaction
-func (s *EtcdStore) BatchOperation(ctx context.Context, ops []clientv3.Op) error {
-	if len(ops) == 0 {
-		return nil
+// WatchShardGroups sets up a watch for all shard groups
+func (s *EtcdStore) WatchShardGroups(ctx context.Context, callback WatchCallback) (CancelFunc, error) {
+	return s.setupWatch(ctx, ShardGroupsPrefix, true, func(event WatchEvent) {
+		// Extract groupID from key
+		event.Key = strings.TrimPrefix(event.Key, ShardGroupsPrefix)
+		callback(event)
+	})
+}
+
+// setupWatch sets up a watch on an etcd key or prefix
+func (s *EtcdStore) setupWatch(
+	ctx context.Context,
+	key string,
+	withPrefix bool,
+	callback WatchCallback,
+) (CancelFunc, error) {
+	// Create a child context that can be cancelled
+	watchCtx, cancel := context.WithCancel(ctx)
+
+	// Store cancel function for cleanup
+	watchID := fmt.Sprintf("%s-%d", key, time.Now().UnixNano())
+	s.activeWatches.Store(watchID, cancel)
+
+	// Setup watch options
+	opts := []clientv3.OpOption{}
+	if withPrefix {
+		opts = append(opts, clientv3.WithPrefix())
 	}
 
-	// Execute the transaction
-	txn := s.client.Txn(ctx)
-	_, err := txn.Then(ops...).Commit()
-	if err != nil {
-		return fmt.Errorf("failed to perform batch operation: %w", err)
-	}
+	// Create the watch channel
+	watchChan := s.client.Watch(watchCtx, key, opts...)
 
-	return nil
+	// Start goroutine to handle watch events
+	go func() {
+		defer func() {
+			cancel()
+			s.activeWatches.Delete(watchID)
+			s.logger.Debug("Watch goroutine stopped", zap.String("key", key))
+		}()
+
+		s.logger.Debug("Started watch", zap.String("key", key), zap.Bool("withPrefix", withPrefix))
+
+		for wresp := range watchChan {
+			if wresp.Canceled {
+				s.logger.Debug("Watch cancelled", zap.String("key", key), zap.Error(wresp.Err()))
+				return
+			}
+
+			for _, ev := range wresp.Events {
+				event := WatchEvent{
+					Key:       string(ev.Kv.Key),
+					Value:     string(ev.Kv.Value),
+					Timestamp: time.Now(),
+				}
+
+				// Convert etcd event type to our event type
+				switch ev.Type {
+				case clientv3.EventTypePut:
+					event.Type = EventTypePut
+				case clientv3.EventTypeDelete:
+					event.Type = EventTypeDelete
+				}
+
+				// Call the callback
+				callback(event)
+			}
+		}
+	}()
+
+	// Return a function to cancel the watch
+	return func() {
+		cancel()
+		s.activeWatches.Delete(watchID)
+	}, nil
 }
 
 // CreateLease creates a new lease with the specified TTL
 func (s *EtcdStore) CreateLease(ctx context.Context, ttl int64) (clientv3.LeaseID, error) {
-	lease, err := s.leaser.Grant(ctx, ttl)
+	lease, err := s.client.Grant(ctx, ttl)
 	if err != nil {
 		return 0, fmt.Errorf("failed to create lease: %w", err)
 	}
@@ -359,7 +431,7 @@ func (s *EtcdStore) CreateLease(ctx context.Context, ttl int64) (clientv3.LeaseI
 
 // RevokeLease revokes a lease
 func (s *EtcdStore) RevokeLease(ctx context.Context, leaseID clientv3.LeaseID) error {
-	_, err := s.leaser.Revoke(ctx, leaseID)
+	_, err := s.client.Revoke(ctx, leaseID)
 	if err != nil {
 		return fmt.Errorf("failed to revoke lease: %w", err)
 	}
@@ -368,9 +440,21 @@ func (s *EtcdStore) RevokeLease(ctx context.Context, leaseID clientv3.LeaseID) e
 
 // KeepAliveLease keeps a lease alive once
 func (s *EtcdStore) KeepAliveLease(ctx context.Context, leaseID clientv3.LeaseID) error {
-	_, err := s.leaser.KeepAliveOnce(ctx, leaseID)
+	_, err := s.client.KeepAliveOnce(ctx, leaseID)
 	if err != nil {
 		return fmt.Errorf("failed to keep lease alive: %w", err)
 	}
 	return nil
+}
+
+// Shutdown cancels all active watches
+func (s *EtcdStore) Shutdown() {
+	s.logger.Info("Shutting down etcd store, cancelling all watches")
+	s.activeWatches.Range(func(key, value interface{}) bool {
+		if cancel, ok := value.(context.CancelFunc); ok {
+			cancel()
+		}
+		s.activeWatches.Delete(key)
+		return true
+	})
 }

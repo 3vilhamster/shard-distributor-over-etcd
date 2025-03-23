@@ -45,7 +45,7 @@ type Service struct {
 	instanceRegistry *registry.Registry
 	shardManager     *shard.Manager
 	healthChecker    *health.Checker
-	stateStore       *store.EtcdStore
+	stateStore       store.Store
 	reconciler       *reconcile.Reconciler
 	strategyRegistry *distribution.StrategyRegistry
 
@@ -67,7 +67,7 @@ type ServiceParams struct {
 	InstanceRegistry *registry.Registry
 	ShardManager     *shard.Manager
 	HealthChecker    *health.Checker
-	StateStore       *store.EtcdStore
+	StateStore       store.Store
 	Reconciler       *reconcile.Reconciler
 	Strategy         distribution.Strategy `optional:"true"`
 }

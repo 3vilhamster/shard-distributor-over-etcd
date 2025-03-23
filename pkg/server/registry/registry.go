@@ -21,7 +21,7 @@ type Registry struct {
 	mu           sync.RWMutex
 	instances    map[string]*InstanceData
 	etcdClient   *clientv3.Client
-	store        *store.EtcdStore
+	store        store.Store
 	logger       *zap.Logger
 	heartbeatTTL int64
 	clock        clockwork.Clock
@@ -39,7 +39,7 @@ type Registry struct {
 type RegistryParams struct {
 	fx.In
 
-	Store      *store.EtcdStore
+	Store      store.Store
 	Logger     *zap.Logger
 	EtcdClient *clientv3.Client
 	Clock      clockwork.Clock `optional:"true"` // Optional to allow default value

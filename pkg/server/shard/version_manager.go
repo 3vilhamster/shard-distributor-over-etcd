@@ -2,6 +2,7 @@ package shard
 
 import (
 	"context"
+	"strconv"
 	"sync"
 	"time"
 
@@ -15,52 +16,151 @@ import (
 // VersionManager manages versions for shards and shard groups
 type VersionManager struct {
 	mu             sync.RWMutex
-	store          *store.EtcdStore
+	store          store.Store
 	clock          clockwork.Clock
 	shardVersions  map[string]int64    // Local cache of shard versions
 	globalVersion  int64               // Current global version
 	versionHistory map[int64]time.Time // When each version was created
-	logger         *zap.Logger         // Optional logger
+	logger         *zap.Logger
+	ctx            context.Context
+	cancel         context.CancelFunc
+	watchCancel    store.CancelFunc // Cancel function for global version watch
+	initialized    bool
 }
 
 // VersionManagerParams defines dependencies for creating a version manager
 type VersionManagerParams struct {
 	fx.In
 
-	Store  *store.EtcdStore
-	Clock  clockwork.Clock `optional:"true"`
-	Logger *zap.Logger     `optional:"true"`
+	Store     store.Store
+	Clock     clockwork.Clock `optional:"true"`
+	Logger    *zap.Logger     `optional:"true"`
+	Lifecycle fx.Lifecycle
 }
 
 // NewVersionManager creates a new version manager
-func NewVersionManager(store *store.EtcdStore, clock clockwork.Clock) *VersionManager {
-	if clock == nil {
-		clock = clockwork.NewRealClock()
-	}
-
-	return &VersionManager{
-		store:          store,
-		clock:          clock,
-		shardVersions:  make(map[string]int64),
-		versionHistory: make(map[int64]time.Time),
-	}
-}
-
-// NewVersionManagerWithFx creates a new version manager with fx
-func NewVersionManagerWithFx(params VersionManagerParams) *VersionManager {
-	// Use defaults for optional dependencies
-	clock := params.Clock
-	if clock == nil {
-		clock = clockwork.NewRealClock()
-	}
+func NewVersionManager(params VersionManagerParams) *VersionManager {
+	ctx, cancel := context.WithCancel(context.Background())
 
 	return &VersionManager{
 		store:          params.Store,
-		clock:          clock,
+		clock:          params.Clock,
 		shardVersions:  make(map[string]int64),
 		versionHistory: make(map[int64]time.Time),
 		logger:         params.Logger,
+		ctx:            ctx,
+		cancel:         cancel,
 	}
+}
+
+// Start initializes the version manager and subscribes to global version changes
+func (vm *VersionManager) Start(ctx context.Context) error {
+	vm.mu.Lock()
+	defer vm.mu.Unlock()
+
+	if vm.initialized {
+		return nil // Already initialized
+	}
+
+	// Load the global version first
+	globalVersion, err := vm.store.GetGlobalVersion(ctx)
+	if err != nil {
+		return err
+	}
+
+	vm.globalVersion = globalVersion
+	vm.recordVersionTimestamp(globalVersion)
+
+	vm.logger.Info("Initialized version manager with global version",
+		zap.Int64("globalVersion", globalVersion))
+
+	// Subscribe to global version changes
+	watchCancel, err := vm.store.WatchGlobalVersion(vm.ctx, vm.handleGlobalVersionChange)
+	if err != nil {
+		return err
+	}
+	vm.watchCancel = watchCancel
+
+	vm.initialized = true
+	return nil
+}
+
+// handleGlobalVersionChange is called when the global version changes in the store
+func (vm *VersionManager) handleGlobalVersionChange(event store.WatchEvent) {
+	if event.Type != store.EventTypePut {
+		return // Only care about puts
+	}
+
+	// Parse the version
+	versionStr := event.Value
+	version, err := strconv.ParseInt(versionStr, 10, 64)
+	if err != nil {
+		vm.logger.Warn("Failed to parse global version",
+			zap.String("versionStr", versionStr),
+			zap.Error(err))
+		return
+	}
+
+	vm.mu.Lock()
+	defer vm.mu.Unlock()
+
+	// Only update if the version is newer
+	if version > vm.globalVersion {
+		vm.logger.Info("Global version updated",
+			zap.Int64("oldVersion", vm.globalVersion),
+			zap.Int64("newVersion", version))
+
+		vm.globalVersion = version
+		vm.recordVersionTimestamp(version)
+	}
+}
+
+// Stop stops the version manager and cancels any subscriptions
+func (vm *VersionManager) Stop(ctx context.Context) error {
+	vm.mu.Lock()
+	defer vm.mu.Unlock()
+
+	if vm.watchCancel != nil {
+		vm.watchCancel()
+		vm.watchCancel = nil
+	}
+
+	vm.cancel()
+	vm.initialized = false
+
+	return nil
+}
+
+// SyncVersions loads all version information from the store
+func (vm *VersionManager) SyncVersions(ctx context.Context, shardIDs []string) error {
+	vm.logger.Info("Synchronizing versions from store")
+
+	// Load global version
+	globalVersion, err := vm.store.GetGlobalVersion(ctx)
+	if err != nil {
+		return err
+	}
+
+	vm.SetGlobalVersion(globalVersion)
+
+	// Load shard versions
+	for _, shardID := range shardIDs {
+		version, err := vm.store.GetShardVersion(ctx, shardID)
+		if err != nil {
+			vm.logger.Warn("Failed to load version for shard",
+				zap.String("shardID", shardID),
+				zap.Error(err))
+			continue
+		}
+
+		vm.SetShardVersion(shardID, version)
+	}
+
+	vm.logger.Info("Version synchronization complete",
+		zap.Int64("globalVersion", globalVersion),
+		zap.Int("shardCount", len(shardIDs)))
+
+	return nil
 }
 
 // GetShardVersion returns the current version for a shard
@@ -126,6 +226,30 @@ func (vm *VersionManager) IncrementGlobalVersion(ctx context.Context) (int64, er
 	return newVersion, nil
 }
 
+// SaveShardVersionToStore ensures a shard's version is saved to the store
+func (vm *VersionManager) SaveShardVersionToStore(ctx context.Context, shardID string) error {
+	vm.mu.RLock()
+	version, exists := vm.shardVersions[shardID]
+	vm.mu.RUnlock()
+
+	if !exists {
+		// If we don't have a version, use the global version
+		vm.mu.RLock()
+		version = vm.globalVersion
+		vm.mu.RUnlock()
+	}
+
+	// Save to store
+	err := vm.store.SaveShardVersion(ctx, shardID, version)
+	if err != nil {
+		return err
+	}
+
+	// Ensure our cache is updated
+	vm.SetShardVersion(shardID, version)
+	return nil
+}
+
 // LoadShardVersions loads all shard versions from storage
 func (vm *VersionManager) LoadShardVersions(ctx context.Context, shardIDs []string) error {
 	vm.mu.Lock()
@@ -174,12 +298,10 @@ func (vm *VersionManager) UpdateShardVersions(ctx context.Context, shardVersions
 	go func() {
 		for shardID, version := range shardVersions {
 			if err := vm.store.SaveShardVersion(context.Background(), shardID, version); err != nil {
-				if vm.logger != nil {
-					vm.logger.Warn("Failed to save shard version",
-						zap.String("shard", shardID),
-						zap.Int64("version", version),
-						zap.Error(err))
-				}
+				vm.logger.Warn("Failed to save shard version",
+					zap.String("shard", shardID),
+					zap.Int64("version", version),
+					zap.Error(err))
 			}
 		}
 	}()

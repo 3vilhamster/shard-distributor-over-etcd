@@ -4,8 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"time"
-
-	"github.com/jonboulle/clockwork"
 )
 
 // Group represents a group of shards for a specific workload type
@@ -34,9 +32,7 @@ type GroupStats struct {
 }
 
 // NewShardGroup creates a new shard group with generated shard IDs
-func NewShardGroup(groupID string, shardCount int) *Group {
-	now := time.Now()
-
+func NewShardGroup(groupID string, shardCount int, now time.Time) *Group {
 	shardIDs := make([]string, shardCount)
 	for i := 0; i < shardCount; i++ {
 		shardIDs[i] = fmt.Sprintf("%s-shard-%d", groupID, i)
@@ -161,23 +157,4 @@ func (g *Group) GetInstancesPerShard() float64 {
 		return 0
 	}
 	return float64(g.Stats.InstanceCount) / float64(g.Stats.AssignedCount)
-}
-
-// NewGroupWithClock creates a new shard group with a specific clock
-func NewGroupWithClock(groupID string, shardCount int, clock clockwork.Clock) *Group {
-	now := clock.Now()
-
-	shardIDs := make([]string, shardCount)
-	for i := 0; i < shardCount; i++ {
-		shardIDs[i] = fmt.Sprintf("%s-shard-%d", groupID, i)
-	}
-
-	return &Group{
-		GroupID:     groupID,
-		Description: fmt.Sprintf("Shard group for %s", groupID),
-		ShardIDs:    shardIDs,
-		Metadata:    make(map[string]string),
-		CreatedAt:   now,
-		UpdatedAt:   now,
-	}
 }

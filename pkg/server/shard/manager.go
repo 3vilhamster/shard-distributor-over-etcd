@@ -22,7 +22,7 @@ type StreamProvider func(instanceID string) []proto.ShardDistributor_ShardDistri
 // Manager manages shard assignments and distribution
 type Manager struct {
 	mu                   sync.RWMutex
-	store                *store.EtcdStore
+	store                store.Store
 	logger               *zap.Logger
 	registry             *registry.Registry
 	assignments          map[string]string // shardID -> instanceID
@@ -45,11 +45,12 @@ type Manager struct {
 type ManagerParams struct {
 	fx.In
 
-	Store    *store.EtcdStore
-	Logger   *zap.Logger
-	Registry *registry.Registry
-	Strategy distribution.Strategy `optional:"true"`
-	Clock    clockwork.Clock       `optional:"true"`
+	Store          store.Store
+	VersionManager *VersionManager
+	Logger         *zap.Logger
+	Registry       *registry.Registry
+	Strategy       distribution.Strategy `optional:"true"`
+	Clock          clockwork.Clock       `optional:"true"`
 }
 
 // NewManager creates a new shard manager
@@ -70,10 +71,9 @@ func NewManager(params ManagerParams) *Manager {
 		logger:               params.Logger,
 		registry:             params.Registry,
 		assignments:          make(map[string]string),
-		versionManager:       NewVersionManager(params.Store, clock),
+		versionManager:       params.VersionManager,
 		distributionStrategy: strategy,
 		groups:               make(map[string]*Group),
-		notifier:             NewShardNotifier(params.Logger),
 		clock:                clock,
 		pendingTransfers:     make(map[string]string),
 		transferStarts:       make(map[string]time.Time),
@@ -122,7 +122,7 @@ func (m *Manager) RegisterShardGroup(
 	}
 
 	// Create group
-	group := NewShardGroup(groupID, shardCount)
+	group := NewShardGroup(groupID, shardCount, m.clock.Now())
 	group.Description = description
 
 	// Add metadata if provided
