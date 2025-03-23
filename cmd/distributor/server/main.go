@@ -21,7 +21,6 @@ import (
 	"github.com/3vilhamster/shard-distributor-over-etcd/pkg/server/leader"
 	"github.com/3vilhamster/shard-distributor-over-etcd/pkg/server/reconcile"
 	"github.com/3vilhamster/shard-distributor-over-etcd/pkg/server/registry"
-	"github.com/3vilhamster/shard-distributor-over-etcd/pkg/server/shard"
 	"github.com/3vilhamster/shard-distributor-over-etcd/pkg/server/store"
 )
 
@@ -133,17 +132,8 @@ func main() {
 		fx.Provide(store.NewEtcdStore),
 		fx.Provide(registry.NewRegistry),
 		fx.Provide(leader.NewElection),
-		fx.Provide(shard.NewVersionManager),
 		fx.Provide(health.NewChecker),
 		fx.Provide(reconcile.NewReconciler),
-		fx.Provide(func(store *store.EtcdStore, logger *zap.Logger, registry *registry.Registry) *shard.Manager {
-			logger.Info("store", zap.Any("store", store))
-			return shard.NewManager(shard.ManagerParams{
-				Store:    store,
-				Logger:   logger,
-				Registry: registry,
-			})
-		}),
 
 		// Provide the service
 		fx.Provide(server.NewService),

@@ -3,12 +3,10 @@ package registry
 import (
 	"context"
 	"fmt"
-	"strconv"
 	"sync"
 	"time"
 
 	"github.com/jonboulle/clockwork"
-	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/fx"
 	"go.uber.org/zap"
 
@@ -20,10 +18,9 @@ import (
 type Registry struct {
 	mu           sync.RWMutex
 	instances    map[string]*InstanceData
-	etcdClient   *clientv3.Client
 	store        store.Store
 	logger       *zap.Logger
-	heartbeatTTL int64
+	heartbeatTTL time.Duration
 	clock        clockwork.Clock
 
 	// Callback functions for instance lifecycle events
@@ -35,18 +32,17 @@ type Registry struct {
 	workloadAssignments map[string]map[string]bool // map[workloadType]map[instanceID]bool
 }
 
-// RegistryParams defines dependencies for the registry
-type RegistryParams struct {
+// Params defines dependencies for the registry
+type Params struct {
 	fx.In
 
-	Store      store.Store
-	Logger     *zap.Logger
-	EtcdClient *clientv3.Client
-	Clock      clockwork.Clock `optional:"true"` // Optional to allow default value
+	Store  store.Store
+	Logger *zap.Logger
+	Clock  clockwork.Clock
 }
 
 // NewRegistry creates a new instance registry
-func NewRegistry(params RegistryParams) *Registry {
+func NewRegistry(params Params) *Registry {
 	// If clock wasn't provided, use the real clock
 	clock := params.Clock
 	if clock == nil {
@@ -56,9 +52,8 @@ func NewRegistry(params RegistryParams) *Registry {
 	return &Registry{
 		instances:           make(map[string]*InstanceData),
 		store:               params.Store,
-		etcdClient:          params.EtcdClient,
 		logger:              params.Logger,
-		heartbeatTTL:        30, // Default TTL in seconds
+		heartbeatTTL:        10 * time.Second,
 		workloadAssignments: make(map[string]map[string]bool),
 		clock:               clock,
 	}
@@ -77,27 +72,8 @@ func (r *Registry) RegisterInstance(
 	instanceID := instanceInfo.InstanceId
 	r.logger.Info("Instance registering", zap.String("instance", instanceID))
 
-	// Create lease with TTL (use from metadata or default)
-	ttl := r.heartbeatTTL
-	if instanceInfo.Metadata != nil {
-		if ttlStr, ok := instanceInfo.Metadata["leaseTTL"]; ok {
-			if parsedTTL, err := strconv.ParseInt(ttlStr, 10, 64); err == nil && parsedTTL > 0 {
-				ttl = parsedTTL
-			}
-		}
-	}
-
-	lease, err := r.etcdClient.Grant(ctx, ttl)
-	if err != nil {
-		return &proto.ServerMessage{
-			Type:    proto.ServerMessage_REGISTER_RESPONSE,
-			Success: false,
-			Message: fmt.Sprintf("Failed to create lease: %v", err),
-		}, nil
-	}
-
 	// Register in etcd
-	if err := r.store.SaveInstance(ctx, instanceID, peerAddr, lease.ID); err != nil {
+	if err := r.store.SaveInstance(ctx, instanceID, peerAddr, r.heartbeatTTL); err != nil {
 		return &proto.ServerMessage{
 			Type:    proto.ServerMessage_REGISTER_RESPONSE,
 			Success: false,
@@ -109,7 +85,6 @@ func (r *Registry) RegisterInstance(
 	if existingInstance, exists := r.instances[instanceID]; exists {
 		// Update existing instance
 		existingInstance.Info = instanceInfo
-		existingInstance.LeaseID = lease.ID
 		existingInstance.UpdateHeartbeat()
 		existingInstance.AddStream(stream)
 
@@ -120,7 +95,7 @@ func (r *Registry) RegisterInstance(
 			zap.Int("reconnect_count", existingInstance.Stats.ReconnectCount))
 	} else {
 		// Create new instance
-		instance := NewInstanceData(instanceID, instanceInfo, peerAddr, lease.ID, r.clock)
+		instance := NewInstanceData(instanceID, instanceInfo, peerAddr, r.clock)
 		instance.AddStream(stream)
 		r.instances[instanceID] = instance
 
@@ -135,55 +110,6 @@ func (r *Registry) RegisterInstance(
 		Type:    proto.ServerMessage_REGISTER_RESPONSE,
 		Success: true,
 		Message: "Instance registered successfully",
-		LeaseId: int64(lease.ID),
-	}, nil
-}
-
-// DeregisterInstance deregisters a service instance
-func (r *Registry) DeregisterInstance(
-	ctx context.Context,
-	instanceID string,
-) (*proto.ServerMessage, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	r.logger.Info("Instance deregistering", zap.String("instance", instanceID))
-
-	// Remove from etcd
-	if err := r.store.DeleteInstance(ctx, instanceID); err != nil {
-		return &proto.ServerMessage{
-			Type:    proto.ServerMessage_DEREGISTER_RESPONSE,
-			Success: false,
-			Message: fmt.Sprintf("Failed to deregister in etcd: %v", err),
-		}, nil
-	}
-
-	// Record disconnect time before removing
-	if instance, exists := r.instances[instanceID]; exists {
-		instance.Stats.LastDisconnectAt = r.clock.Now()
-	}
-
-	// Remove from instances map
-	delete(r.instances, instanceID)
-
-	// Remove from workload assignments
-	for workloadType, assignments := range r.workloadAssignments {
-		delete(assignments, instanceID)
-		// If no instances left for this workload, clean it up
-		if len(assignments) == 0 {
-			delete(r.workloadAssignments, workloadType)
-		}
-	}
-
-	// Notify callback
-	if r.onInstanceDeregistered != nil {
-		go r.onInstanceDeregistered(instanceID)
-	}
-
-	return &proto.ServerMessage{
-		Type:    proto.ServerMessage_DEREGISTER_RESPONSE,
-		Success: true,
-		Message: "Instance deregistered successfully",
 	}, nil
 }
 
@@ -225,34 +151,6 @@ func (r *Registry) UpdateInstanceStatus(
 		Success: true,
 		Message: "Status updated",
 	}, nil
-}
-
-// HandleHeartbeat updates the heartbeat timestamp for an instance
-func (r *Registry) HandleHeartbeat(instanceID string) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	// Update heartbeat timestamp
-	instance, exists := r.instances[instanceID]
-	if !exists {
-		return fmt.Errorf("instance not found")
-	}
-
-	instance.UpdateHeartbeat()
-
-	// Refresh lease in background
-	if instance.LeaseID != 0 {
-		go func() {
-			_, err := r.etcdClient.KeepAliveOnce(context.Background(), instance.LeaseID)
-			if err != nil {
-				r.logger.Warn("Failed to keep lease alive",
-					zap.String("instance", instanceID),
-					zap.Error(err))
-			}
-		}()
-	}
-
-	return nil
 }
 
 // HandleInstanceDisconnect processes an instance disconnection

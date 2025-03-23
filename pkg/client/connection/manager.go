@@ -14,7 +14,7 @@ import (
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
 
-	"github.com/3vilhamster/shard-distributor-over-etcd/gen/proto"
+	"github.com/3vilhamster/shard-distributor-over-etcd/gen/proto/sharddistributor/v1"
 )
 
 const (
@@ -30,78 +30,30 @@ const (
 
 // Manager handles the connection to the ShardDistributor service
 type Manager struct {
-	conn                *grpc.ClientConn
-	client              proto.ShardDistributorClient
-	stream              proto.ShardDistributor_ShardDistributorStreamClient
-	instanceID          string
-	instanceInfo        *proto.InstanceInfo
-	serverAddr          string
-	reconnectBackoff    backoff.Config
-	heartbeatInterval   time.Duration
-	heartbeatTicker     *time.Ticker
-	reconnectCh         chan struct{}
-	mutex               sync.RWMutex
-	streamMutex         sync.Mutex
-	logger              *zap.Logger
-	handlers            map[proto.ServerMessage_MessageType][]ServerMessageHandler
-	lastAssignedShards  []string
-	lastLeasedID        int64
-	ctx                 context.Context
-	cancel              context.CancelFunc
-	isRegistered        bool
-	isShutdown          bool
-	onRegistered        func([]string)
-	onConnectionChanged func(connectivity.State)
+	conn               *grpc.ClientConn
+	client             proto.ShardDistributorServiceClient
+	stream             proto.ShardDistributorService_ShardDistributorStreamClient
+	instanceID         string
+	instanceInfo       *proto.InstanceInfo
+	serverAddr         string
+	reconnectBackoff   backoff.Config
+	heartbeatInterval  time.Duration
+	heartbeatTicker    *time.Ticker
+	reconnectCh        chan struct{}
+	streamMutex        sync.Mutex
+	logger             *zap.Logger
+	handlers           map[proto.ShardDistributorStreamResponse_MessageType][]ServerMessageHandler
+	lastAssignedShards []string
+	ctx                context.Context
+	cancel             context.CancelFunc
+	isShutdown         bool
 }
 
 // ServerMessageHandler defines a handler function for server messages
-type ServerMessageHandler func(context.Context, *proto.ServerMessage) error
-
-// ManagerOption defines a functional option for the Manager
-type ManagerOption func(*Manager)
-
-// WithHeartbeatInterval sets the heartbeat interval
-func WithHeartbeatInterval(interval time.Duration) ManagerOption {
-	return func(m *Manager) {
-		m.heartbeatInterval = interval
-	}
-}
-
-// WithLogger sets the logger
-func WithLogger(logger *zap.Logger) ManagerOption {
-	return func(m *Manager) {
-		m.logger = logger
-	}
-}
-
-// WithReconnectBackoff sets custom reconnect backoff parameters
-func WithReconnectBackoff(initialBackoff, maxBackoff time.Duration, jitter float64) ManagerOption {
-	return func(m *Manager) {
-		m.reconnectBackoff = backoff.Config{
-			BaseDelay:  initialBackoff,
-			Multiplier: 1.5,
-			Jitter:     jitter,
-			MaxDelay:   maxBackoff,
-		}
-	}
-}
-
-// WithOnRegistered sets the callback for successful registration
-func WithOnRegistered(callback func([]string)) ManagerOption {
-	return func(m *Manager) {
-		m.onRegistered = callback
-	}
-}
-
-// WithOnConnectionChanged sets the callback for connection state changes
-func WithOnConnectionChanged(callback func(connectivity.State)) ManagerOption {
-	return func(m *Manager) {
-		m.onConnectionChanged = callback
-	}
-}
+type ServerMessageHandler func(context.Context, *proto.ShardDistributorStreamResponse) error
 
 // NewManager creates a new connection manager
-func NewManager(serverAddr, instanceID string, instanceInfo *proto.InstanceInfo, options ...ManagerOption) *Manager {
+func NewManager(serverAddr, instanceID string, instanceInfo *proto.InstanceInfo) *Manager {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	m := &Manager{
@@ -121,18 +73,12 @@ func NewManager(serverAddr, instanceID string, instanceInfo *proto.InstanceInfo,
 		cancel: cancel,
 	}
 
-	m.handlers = map[proto.ServerMessage_MessageType][]ServerMessageHandler{
-		proto.ServerMessage_REGISTER_RESPONSE: {m.handleRegisterResponse},
-		proto.ServerMessage_HEARTBEAT_ACK: {func(ctx context.Context, message *proto.ServerMessage) error {
+	m.handlers = map[proto.ShardDistributorStreamResponse_MessageType][]ServerMessageHandler{
+		proto.ShardDistributorStreamResponse_MESSAGE_TYPE_HEARTBEAT_ACK: {func(ctx context.Context, message *proto.ShardDistributorStreamResponse) error {
 			// Just log at debug level
 			m.logger.Debug("Received heartbeat acknowledgment")
 			return nil
 		}},
-	}
-
-	// Apply options
-	for _, option := range options {
-		option(m)
 	}
 
 	return m
@@ -140,9 +86,6 @@ func NewManager(serverAddr, instanceID string, instanceInfo *proto.InstanceInfo,
 
 // Connect establishes a connection to the ShardDistributor service
 func (m *Manager) Connect(ctx context.Context) error {
-	m.mutex.Lock()
-	defer m.mutex.Unlock()
-
 	if m.isShutdown {
 		return errors.New("manager is shut down")
 	}
@@ -171,7 +114,7 @@ func (m *Manager) Connect(ctx context.Context) error {
 	}
 
 	m.conn = conn
-	m.client = proto.NewShardDistributorClient(conn)
+	m.client = proto.NewShardDistributorServiceClient(conn)
 
 	// Start the state monitor
 	go m.monitorConnectionState()
@@ -208,105 +151,15 @@ func (m *Manager) startStream(ctx context.Context) error {
 	return nil
 }
 
-func (m *Manager) InstanceID() string {
-	return m.instanceID
-}
-
-// Register registers the instance with the server
-func (m *Manager) Register(ctx context.Context) error {
-	m.mutex.Lock()
-	defer m.mutex.Unlock()
-
-	if m.isRegistered {
-		return nil // Already registered
-	}
-
-	m.logger.Info("Registering instance with server",
-		zap.String("instanceID", m.instanceID))
-
-	// Prepare register message
-	msg := &proto.ClientMessage{
-		InstanceId:   m.instanceID,
-		Type:         proto.ClientMessage_REGISTER,
-		InstanceInfo: m.instanceInfo,
-	}
-
-	// Send registration message
-	if err := m.sendMessage(msg); err != nil {
-		return fmt.Errorf("failed to send registration message: %w", err)
-	}
-
-	// Start heartbeat
-	m.startHeartbeat()
-
-	return nil
-}
-
-// Deregister deregisters the instance from the server
-func (m *Manager) Deregister(ctx context.Context) error {
-	m.mutex.Lock()
-	defer m.mutex.Unlock()
-
-	if !m.isRegistered {
-		return nil // Not registered
-	}
-
-	m.logger.Info("Deregistering instance from server",
-		zap.String("instanceID", m.instanceID))
-
-	// Stop heartbeat
-	m.stopHeartbeat()
-
-	// Prepare deregister message
-	msg := &proto.ClientMessage{
-		InstanceId: m.instanceID,
-		Type:       proto.ClientMessage_DEREGISTER,
-	}
-
-	// Send deregistration message
-	if err := m.sendMessage(msg); err != nil {
-		m.logger.Warn("Failed to send deregistration message", zap.Error(err))
-		// Continue with shutdown even if deregistration fails
-	}
-
-	m.isRegistered = false
-	return nil
-}
-
-// StartWatching starts watching for shard assignments
-func (m *Manager) StartWatching(ctx context.Context) error {
-	m.logger.Info("Starting to watch for shard assignments")
-
-	// Prepare watch message
-	msg := &proto.ClientMessage{
-		InstanceId: m.instanceID,
-		Type:       proto.ClientMessage_WATCH,
-	}
-
-	// Send watch message
-	if err := m.sendMessage(msg); err != nil {
-		return fmt.Errorf("failed to send watch message: %w", err)
-	}
-
-	return nil
-}
-
 // AcknowledgeAssignment acknowledges a shard assignment
 func (m *Manager) AcknowledgeAssignment(ctx context.Context, shardID string) error {
-	m.mutex.RLock()
-	defer m.mutex.RUnlock()
-
-	if !m.isRegistered {
-		return errors.New("instance not registered")
-	}
-
 	m.logger.Debug("Acknowledging shard assignment",
 		zap.String("shardID", shardID))
 
 	// Prepare ack message
-	msg := &proto.ClientMessage{
+	msg := &proto.ShardDistributorStreamRequest{
 		InstanceId: m.instanceID,
-		Type:       proto.ClientMessage_ACK,
+		Type:       proto.ShardDistributorStreamRequest_MESSAGE_TYPE_ACK,
 		ShardId:    shardID,
 	}
 
@@ -318,60 +171,19 @@ func (m *Manager) AcknowledgeAssignment(ctx context.Context, shardID string) err
 	return nil
 }
 
-// ReportStatus sends a status report to the server
-func (m *Manager) ReportStatus(ctx context.Context, status *proto.StatusReport) error {
-	m.mutex.RLock()
-	defer m.mutex.RUnlock()
-
-	if !m.isRegistered {
-		return errors.New("instance not registered")
-	}
-
-	m.logger.Debug("Sending status report",
-		zap.String("status", status.Status.String()),
-		zap.Int32("activeShards", status.ActiveShardCount))
-
-	// Prepare status report message
-	msg := &proto.ClientMessage{
-		InstanceId: m.instanceID,
-		Type:       proto.ClientMessage_STATUS_REPORT,
-		Status:     status,
-	}
-
-	// Send status report
-	if err := m.sendMessage(msg); err != nil {
-		return fmt.Errorf("failed to send status report: %w", err)
-	}
-
-	return nil
-}
-
 // RegisterHandler registers a handler for a specific message type
-func (m *Manager) RegisterHandler(msgType proto.ServerMessage_MessageType, handler ServerMessageHandler) {
-	m.mutex.Lock()
-	defer m.mutex.Unlock()
-
+func (m *Manager) RegisterHandler(msgType proto.ShardDistributorStreamResponse_MessageType, handler ServerMessageHandler) {
 	m.handlers[msgType] = append(m.handlers[msgType], handler)
 }
 
 // Shutdown gracefully shuts down the connection manager
 func (m *Manager) Shutdown(ctx context.Context) error {
-	m.mutex.Lock()
-	defer m.mutex.Unlock()
-
 	if m.isShutdown {
 		return nil // Already shut down
 	}
 
 	m.logger.Info("Shutting down connection manager")
 	m.isShutdown = true
-
-	// Deregister if registered
-	if m.isRegistered {
-		if err := m.Deregister(ctx); err != nil {
-			m.logger.Warn("Failed to deregister during shutdown", zap.Error(err))
-		}
-	}
 
 	// Stop heartbeat
 	m.stopHeartbeat()
@@ -396,29 +208,8 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-// IsRegistered returns whether the instance is registered
-func (m *Manager) IsRegistered() bool {
-	m.mutex.RLock()
-	defer m.mutex.RUnlock()
-	return m.isRegistered
-}
-
-// LastAssignedShards returns the last assigned shards from registration
-func (m *Manager) LastAssignedShards() []string {
-	m.mutex.RLock()
-	defer m.mutex.RUnlock()
-	return m.lastAssignedShards
-}
-
-// LastLeaseID returns the last lease ID from registration
-func (m *Manager) LastLeaseID() int64 {
-	m.mutex.RLock()
-	defer m.mutex.RUnlock()
-	return m.lastLeasedID
-}
-
 // sendMessage sends a message to the server
-func (m *Manager) sendMessage(msg *proto.ClientMessage) error {
+func (m *Manager) sendMessage(msg *proto.ShardDistributorStreamRequest) error {
 	m.streamMutex.Lock()
 	defer m.streamMutex.Unlock()
 
@@ -475,10 +266,8 @@ func (m *Manager) receiveMessages() {
 }
 
 // handleServerMessage processes incoming server messages
-func (m *Manager) handleServerMessage(msg *proto.ServerMessage) error {
-	m.mutex.RLock()
+func (m *Manager) handleServerMessage(msg *proto.ShardDistributorStreamResponse) error {
 	handlers := m.handlers[msg.Type]
-	m.mutex.RUnlock()
 
 	// Call registered handlers
 	ctx := context.Background()
@@ -490,32 +279,6 @@ func (m *Manager) handleServerMessage(msg *proto.ServerMessage) error {
 		}
 	}
 
-	return nil
-}
-
-// handleRegisterResponse processes registration response
-func (m *Manager) handleRegisterResponse(ctx context.Context, msg *proto.ServerMessage) error {
-	m.mutex.Lock()
-	defer m.mutex.Unlock()
-
-	if !msg.Success {
-		m.logger.Error("Registration failed",
-			zap.String("reason", msg.Message))
-		return fmt.Errorf("registration failed: %s", msg.Message)
-	}
-
-	m.isRegistered = true
-	m.lastLeasedID = msg.LeaseId
-	m.lastAssignedShards = msg.AssignedShards
-
-	m.logger.Info("Registration successful",
-		zap.Int64("leaseID", msg.LeaseId),
-		zap.Int("assignedShards", len(msg.AssignedShards)))
-
-	// Call the registered callback
-	if m.onRegistered != nil {
-		go m.onRegistered(msg.AssignedShards)
-	}
 	return nil
 }
 
@@ -533,9 +296,9 @@ func (m *Manager) startHeartbeat() {
 				return
 			case <-m.heartbeatTicker.C:
 				// Send heartbeat
-				msg := &proto.ClientMessage{
+				msg := &proto.ShardDistributorStreamRequest{
 					InstanceId: m.instanceID,
-					Type:       proto.ClientMessage_HEARTBEAT,
+					Type:       proto.ShardDistributorStreamRequest_MESSAGE_TYPE_HEARTBEAT,
 				}
 				if err := m.sendMessage(msg); err != nil {
 					m.logger.Warn("Failed to send heartbeat", zap.Error(err))
@@ -580,11 +343,6 @@ func (m *Manager) monitorConnectionState() {
 					zap.String("to", currentState.String()))
 
 				lastState = currentState
-
-				// Notify state change
-				if m.onConnectionChanged != nil {
-					m.onConnectionChanged(currentState)
-				}
 			}
 
 			// If disconnected, try to reconnect
@@ -608,10 +366,6 @@ func (m *Manager) monitorConnectionState() {
 
 // handleReconnect handles the reconnection process
 func (m *Manager) handleReconnect() {
-	m.mutex.Lock()
-	wasRegistered := m.isRegistered
-	m.mutex.Unlock()
-
 	// Close existing resources
 	m.streamMutex.Lock()
 	if m.stream != nil {
@@ -644,30 +398,6 @@ func (m *Manager) handleReconnect() {
 
 		if err == nil {
 			m.logger.Info("Successfully reconnected")
-
-			// Re-register if needed
-			if wasRegistered {
-				m.mutex.Lock()
-				m.isRegistered = false
-				m.mutex.Unlock()
-
-				registrationCtx, registrationCancel := context.WithTimeout(m.ctx, 5*time.Second)
-				if err := m.Register(registrationCtx); err != nil {
-					registrationCancel()
-					m.logger.Error("Failed to re-register after reconnection", zap.Error(err))
-					continue
-				}
-				registrationCancel()
-
-				// Restart watching
-				watchCtx, watchCancel := context.WithTimeout(m.ctx, 5*time.Second)
-				if err := m.StartWatching(watchCtx); err != nil {
-					watchCancel()
-					m.logger.Error("Failed to restart watching after reconnection", zap.Error(err))
-				}
-				watchCancel()
-			}
-
 			return
 		}
 

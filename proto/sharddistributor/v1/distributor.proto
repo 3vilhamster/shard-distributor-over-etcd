@@ -1,0 +1,86 @@
+syntax = "proto3";
+
+package sharddistributor.v1;
+
+option go_package = "github.com/3vilhamster/shard-distributor-over-etcd/proto";
+
+// ShardDistributorService service provides fast shard distribution notifications
+service ShardDistributorService {
+  // ShardDistributorStream provides a bidirectional stream for all communications:
+  // - Instance registration and deregistration
+  // - Shard assignment watching and heartbeats
+  // - Status updates
+  rpc ShardDistributorStream(stream ShardDistributorStreamRequest) returns (stream ShardDistributorStreamResponse) {}
+}
+
+// ClientMessage encapsulates all possible messages from client to server
+message ShardDistributorStreamRequest {
+  string instance_id = 1;
+
+  enum MessageType {
+    MESSAGE_TYPE_INVALID = 0;
+    MESSAGE_TYPE_HEARTBEAT = 1;      // HEARTBEAT instance
+    MESSAGE_TYPE_STOPPING = 2;       // Deregister instance
+    MESSAGE_TYPE_WATCH = 3;          // Start watching for shard assignments
+    MESSAGE_TYPE_ACK = 4;            // Acknowledge assignment
+    MESSAGE_TYPE_STATUS_REPORT = 5;  // Report instance status
+  }
+  MessageType type = 2;
+
+  string namespace = 3;
+
+  // Fields based on message type
+  InstanceInfo instance_info = 4;         // For REGISTER
+  StatusReport status = 5;                // For STATUS_REPORT
+  string shard_id = 6;                    // For ACK
+  map<string, string> metadata = 7;       // Additional metadata
+}
+
+// ServerMessage encapsulates all possible messages from server to client
+message ShardDistributorStreamResponse {
+  enum MessageType {
+    MESSAGE_TYPE_INVALID = 0;
+    MESSAGE_TYPE_REGISTER_RESPONSE = 1;    // Response to registration
+    MESSAGE_TYPE_SHARD_ASSIGNMENT = 2;     // Shard assignment/revocation
+    MESSAGE_TYPE_STATUS_RESPONSE = 3;      // Response to status report
+    MESSAGE_TYPE_HEARTBEAT_ACK = 4;        // Acknowledge heartbeat
+  }
+  MessageType type = 2;
+
+  string namespace = 3;
+
+  // Fields for REGISTER_RESPONSE
+  bool success = 4;
+  string message = 5;
+  repeated string assigned_shards = 6;
+
+  // Fields for SHARD_ASSIGNMENT
+  string shard_id = 7;
+  ShardAssignmentAction action = 8;
+  string source_instance_id = 10;
+}
+
+enum ShardAssignmentAction {
+  SHARD_ASSIGNMENT_ACTION_INVALID = 0;
+  SHARD_ASSIGNMENT_ACTION_PREPARE_ADD = 1;    // Assign shard to instance
+  SHARD_ASSIGNMENT_ACTION_PREPARE_DROP = 2;   // Prepare instance for fast activation
+  SHARD_ASSIGNMENT_ACTION_ADD = 3;    // Revoke shard from instance
+  SHARD_ASSIGNMENT_ACTION_DROP = 4;
+}
+
+// Keep these for backward compatibility or reference
+message InstanceInfo {
+  string instance_id = 1;
+}
+
+message StatusReport {
+  string instance_id = 1;
+  enum Status {
+    STATUS_INVALID = 0;
+    STATUS_ACTIVE = 1;
+    STATUS_DRAINING = 2;
+  }
+  Status status = 2;
+
+  map<string,string> metadata = 3;
+}

@@ -3,9 +3,6 @@ package registry
 import (
 	"time"
 
-	"github.com/jonboulle/clockwork"
-	clientv3 "go.etcd.io/etcd/client/v3"
-
 	"github.com/3vilhamster/shard-distributor-over-etcd/gen/proto"
 )
 
@@ -17,18 +14,11 @@ type InstanceData struct {
 	Status     *proto.StatusReport
 	Endpoint   string
 
-	// Resource management
-	LeaseID       clientv3.LeaseID
-	LastHeartbeat time.Time
-
 	// Communication streams
 	Streams []proto.ShardDistributor_ShardDistributorStreamServer
 
 	// Stats and metrics
 	Stats InstanceStats
-
-	// clock for time operations (for testability)
-	clock clockwork.Clock
 }
 
 // InstanceStats contains operational statistics for an instance
@@ -53,11 +43,8 @@ func NewInstanceData(
 	instanceID string,
 	info *proto.InstanceInfo,
 	endpoint string,
-	leaseID clientv3.LeaseID,
-	clock clockwork.Clock,
+	now time.Time,
 ) *InstanceData {
-	now := clock.Now()
-
 	return &InstanceData{
 		InstanceID: instanceID,
 		Info:       info,
@@ -65,14 +52,11 @@ func NewInstanceData(
 			InstanceId: instanceID,
 			Status:     proto.StatusReport_ACTIVE,
 		},
-		Endpoint:      endpoint,
-		LeaseID:       leaseID,
-		LastHeartbeat: now,
-		Streams:       make([]proto.ShardDistributor_ShardDistributorStreamServer, 0),
+		Endpoint: endpoint,
+		Streams:  make([]proto.ShardDistributor_ShardDistributorStreamServer, 0),
 		Stats: InstanceStats{
 			ConnectedAt: now,
 		},
-		clock: clock,
 	}
 }
 
@@ -102,15 +86,9 @@ func (i *InstanceData) GetStreamCount() int {
 	return len(i.Streams)
 }
 
-// UpdateHeartbeat updates the heartbeat timestamp
-func (i *InstanceData) UpdateHeartbeat() {
-	i.LastHeartbeat = i.clock.Now()
-}
-
 // UpdateStatus updates the instance status
 func (i *InstanceData) UpdateStatus(status *proto.StatusReport) {
 	i.Status = status
-	i.UpdateHeartbeat()
 
 	// Update stats
 	i.Stats.CurrentActiveShards = int(status.ActiveShardCount)
@@ -120,14 +98,4 @@ func (i *InstanceData) UpdateStatus(status *proto.StatusReport) {
 // IsDraining returns whether the instance is in draining state
 func (i *InstanceData) IsDraining() bool {
 	return i.Status.Status == proto.StatusReport_DRAINING
-}
-
-// IsOverloaded returns whether the instance is overloaded
-func (i *InstanceData) IsOverloaded() bool {
-	return i.Status.Status == proto.StatusReport_OVERLOADED
-}
-
-// TimeSinceHeartbeat returns the duration since the last heartbeat
-func (i *InstanceData) TimeSinceHeartbeat() time.Duration {
-	return i.clock.Now().Sub(i.LastHeartbeat)
 }

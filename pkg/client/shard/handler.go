@@ -2,6 +2,8 @@ package shard
 
 import (
 	"context"
+
+	"go.uber.org/zap"
 )
 
 // Handler defines the interface for shard handlers
@@ -10,15 +12,15 @@ import (
 type Handler interface {
 	// Prepare prepares the shard for activation (e.g., loading data)
 	// This is used for fast handovers
-	Prepare(ctx context.Context, shardID string, version int64) error
+	Prepare(ctx context.Context, shardID string) error
 
 	// Activate activates the shard (e.g., starting processing)
-	Activate(ctx context.Context, shardID string, version int64) error
+	Activate(ctx context.Context, shardID string) error
 
 	// Deactivate deactivates the shard (e.g., stopping processing)
 	// The handler should make sure any in-flight work is completed
 	// or properly saved before returning
-	Deactivate(ctx context.Context, shardID string, version int64) error
+	Deactivate(ctx context.Context, shardID string) error
 
 	// GetType returns the type of shard this handler can process
 	GetType() string
@@ -39,7 +41,7 @@ func (h *BaseHandler) GetType() string {
 }
 
 // HandlerFactory is a function that creates a new handler
-type HandlerFactory func() Handler
+type HandlerFactory func(logger *zap.Logger) Handler
 
 // HandlerRegistry keeps track of handler factories for different shard types
 type HandlerRegistry struct {
@@ -58,13 +60,13 @@ func (r *HandlerRegistry) Register(shardType string, factory HandlerFactory) {
 	r.factories[shardType] = factory
 }
 
-// Create creates a new handler for a specific shard type
-func (r *HandlerRegistry) Create(shardType string) (Handler, bool) {
+// GetFactory returns a factory or nil.
+func (r *HandlerRegistry) GetFactory(shardType string) HandlerFactory {
 	factory, ok := r.factories[shardType]
 	if !ok {
-		return nil, false
+		return nil
 	}
-	return factory(), true
+	return factory
 }
 
 // GetTypes returns all registered shard types
@@ -76,8 +78,8 @@ func (r *HandlerRegistry) GetTypes() []string {
 	return types
 }
 
-// ShardHandlerConfig defines configuration for shard handlers
-type ShardHandlerConfig struct {
+// HandlerConfig defines configuration for shard handlers
+type HandlerConfig struct {
 	// MaxConcurrentOperations is the maximum number of concurrent operations
 	MaxConcurrentOperations int
 
@@ -89,7 +91,7 @@ type ShardHandlerConfig struct {
 }
 
 // DefaultShardHandlerConfig provides default configuration values
-var DefaultShardHandlerConfig = ShardHandlerConfig{
+var DefaultShardHandlerConfig = HandlerConfig{
 	MaxConcurrentOperations: 10,
 	ShutdownTimeout:         30, // seconds
 	CustomConfig:            make(map[string]interface{}),

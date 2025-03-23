@@ -3,7 +3,7 @@ set -e
 
 # Use environment variables if set, otherwise use defaults
 SERVER_ADDR=${SERVER_ADDR:-"server:50051"}
-SHARD_TYPES=${SHARD_TYPES:-"default"}
+NAMESPACES=${NAMESPACES:-"default"}
 LOG_LEVEL=${LOG_LEVEL:-"info"}
 HEARTBEAT_INTERVAL=${HEARTBEAT_INTERVAL:-5}
 REPORT_INTERVAL=${REPORT_INTERVAL:-10}
@@ -13,7 +13,7 @@ GRACEFUL_SHUTDOWN=${GRACEFUL_SHUTDOWN:-false}
 # Build the command with all parameters
 CMD="/app/client"
 CMD+=" --server=${SERVER_ADDR}"
-CMD+=" --shard-types=${SHARD_TYPES}"
+CMD+=" --namespaces=${NAMESPACES}"
 CMD+=" --log-level=${LOG_LEVEL}"
 CMD+=" --heartbeat=${HEARTBEAT_INTERVAL}s"
 CMD+=" --report=${REPORT_INTERVAL}s"

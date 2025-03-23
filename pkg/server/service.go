@@ -43,7 +43,6 @@ type Service struct {
 	// Components
 	leaderElection   *leader.Election
 	instanceRegistry *registry.Registry
-	shardManager     *shard.Manager
 	healthChecker    *health.Checker
 	stateStore       store.Store
 	reconciler       *reconcile.Reconciler
@@ -65,7 +64,6 @@ type ServiceParams struct {
 	EtcdClient       *clientv3.Client
 	LeaderElection   *leader.Election
 	InstanceRegistry *registry.Registry
-	ShardManager     *shard.Manager
 	HealthChecker    *health.Checker
 	StateStore       store.Store
 	Reconciler       *reconcile.Reconciler
@@ -96,7 +94,6 @@ func NewService(params ServiceParams) (*Service, error) {
 		grpcServer:       grpc.NewServer(),
 		leaderElection:   params.LeaderElection,
 		instanceRegistry: params.InstanceRegistry,
-		shardManager:     params.ShardManager,
 		healthChecker:    params.HealthChecker,
 		stateStore:       params.StateStore,
 		reconciler:       params.Reconciler,
@@ -150,27 +147,22 @@ func (s *Service) connectComponents() {
 		// On instance registered
 		func(instanceID string) {
 			s.logger.Info("Instance registered callback", zap.String("instance", instanceID))
-			s.recalculateDistribution()
+			s.reconciler.ForceReconciliation()
 		},
 		// On instance deregistered
 		func(instanceID string) {
 			s.logger.Info("Instance deregistered callback", zap.String("instance", instanceID))
-			s.recalculateDistribution()
+			s.reconciler.ForceReconciliation()
 		},
 		// On instance draining
 		func(instanceID string) {
 			s.logger.Info("Instance draining callback", zap.String("instance", instanceID))
-			s.recalculateDistribution()
+			s.reconciler.ForceReconciliation()
 		},
 	)
 
 	// Set callback for leadership changes
 	s.leaderElection.SetCallback(s.onLeadershipChange)
-
-	// Set shard manager stream provider
-	s.shardManager.SetStreamProvider(func(instanceID string) []proto.ShardDistributor_ShardDistributorStreamServer {
-		return s.instanceRegistry.GetInstanceStreams(instanceID)
-	})
 
 	// Set health checker callback
 	s.healthChecker.SetCallback(func(instanceID string) {
@@ -186,32 +178,8 @@ func (s *Service) Start(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.logger.Info("locked service")
-
 	if s.isRunning {
 		return fmt.Errorf("service already running")
-	}
-
-	s.logger.Info("initializing global version")
-
-	// Initialize the store's global version
-	if err := s.stateStore.InitializeGlobalVersion(ctx); err != nil {
-		return fmt.Errorf("failed to initialize global version: %w", err)
-	}
-
-	s.logger.Info("loading shard definitions")
-
-	// Initialize shards
-	if err := s.shardManager.LoadShardDefinitions(ctx, s.config.ShardCount); err != nil {
-		return fmt.Errorf("failed to initialize shards: %w", err)
-	}
-
-	s.logger.Info("loading shard groups")
-
-	// Load any existing shard groups
-	if err := s.shardManager.LoadShardGroups(ctx); err != nil {
-		s.logger.Warn("Failed to load shard groups", zap.Error(err))
-		// Continue anyway as this is not fatal
 	}
 
 	s.logger.Info("starting listener for grpc")
@@ -243,17 +211,6 @@ func (s *Service) Start(ctx context.Context) error {
 		zap.Strings("etcd_endpoints", s.config.EtcdEndpoints))
 
 	return nil
-}
-
-// recalculateDistribution triggers redistribution if leader
-func (s *Service) recalculateDistribution() {
-	s.mu.RLock()
-	isLeader := s.leaderElection.IsLeader()
-	s.mu.RUnlock()
-
-	if isLeader {
-		s.shardManager.RecalculateDistribution()
-	}
 }
 
 // Stop stops the shard distributor service

@@ -1,90 +1,134 @@
 services:
-  etcd:
-    image: bitnami/etcd:latest
-    container_name: etcd-server
+  # etcd cluster
+  etcd1:
+    image: quay.io/coreos/etcd:v3.5.0
     environment:
-      - ALLOW_NONE_AUTHENTICATION=yes
-      - ETCD_ADVERTISE_CLIENT_URLS=http://0.0.0.0:2379
+      - ETCD_NAME=etcd1
+      - ETCD_INITIAL_ADVERTISE_PEER_URLS=http://etcd1:2380
+      - ETCD_LISTEN_PEER_URLS=http://0.0.0.0:2380
       - ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379
+      - ETCD_ADVERTISE_CLIENT_URLS=http://etcd1:2379
+      - ETCD_INITIAL_CLUSTER=etcd1=http://etcd1:2380
+      - ETCD_INITIAL_CLUSTER_STATE=new
+      - ETCD_INITIAL_CLUSTER_TOKEN=etcd-cluster-1
     ports:
       - "2379:2379"
-      - "2380:2380"
     networks:
-      - shard-network
+      - shard-distributor-net
     healthcheck:
       test: ["CMD", "etcdctl", "endpoint", "health"]
-      interval: 5s
+      interval: 10s
       timeout: 5s
       retries: 3
+      start_period: 10s
 
-  # Distributor server with two instances
-  distributor-server:
+  server:
     build:
       context: .
+      dockerfile: Dockerfile.server
+    command:
+      - "--server=0.0.0.0:50051"
+      - "--etcd=etcd1:2379"
+      - "--log-level=${LOG_LEVEL:-debug}"
+      - "--reconcile-interval=${RECONCILE_INTERVAL:-15s}"
+      - "--health-interval=${HEALTH_INTERVAL:-5s}"
+      - "--leader-path=/shard-distributor/leader"
+      - "--strategy=farmHash"
+    ports:
+      - "50051-50053:50051"
+    depends_on:
+      etcd1:
+        condition: service_healthy
+    networks:
+      - shard-distributor-net
+    healthcheck:
+      # Use HTTP health endpoint instead of grpc_health_probe
+      test: ["CMD", "/app/grpc_health_probe", "-addr=:50051"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 3s
+    deploy:
+      replicas: 3
+
+  # Client instances for type1 shards
+  client-type1:
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+    environment:
+      - SERVER_ADDR=server:50051
+      - NAMESPACES=type1
+      - LOG_LEVEL=debug
+      - HEARTBEAT_INTERVAL=5
+      - REPORT_INTERVAL=10
+      - SHUTDOWN_AFTER=60
+      - GRACEFUL_SHUTDOWN=true
+    depends_on:
+      server:
+        condition: service_healthy
+    networks:
+      - shard-distributor-net
     deploy:
       replicas: 2
-    depends_on:
-      etcd:
-        condition: service_healthy
+
+  # Client instances for type2 shards
+  client-type2:
+    build:
+      context: .
+      dockerfile: Dockerfile.client
     environment:
-      - ETCD_ENDPOINTS=etcd:2379
+      - SERVER_ADDR=server:50051
+      - NAMESPACES=type2
+      - LOG_LEVEL=debug
+      - HEARTBEAT_INTERVAL=5
+      - REPORT_INTERVAL=10
+      - SHUTDOWN_AFTER=60
+      - GRACEFUL_SHUTDOWN=true
+    depends_on:
+      server:
+        condition: service_healthy
     networks:
-      - shard-network
-    expose:
-      - "50051"
-    command: ["-mode=server", "-etcd=etcd:2379", "-server=0.0.0.0:50051", "-shards=20"]
-    healthcheck:
-      test: ["CMD", "/app/shard-distributor", "-mode=healthcheck", "-server=127.0.0.1:50051"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-      start_period: 5s
+      - shard-distributor-net
+    deploy:
+      replicas: 2
 
-  # Initial set of client instances
-  client1:
+  # Shard generator to create test shards
+  shard-generator:
     build:
       context: .
+      dockerfile: Dockerfile.generator
+    environment:
+      - ETCD_ENDPOINTS=etcd1:2379
+      - NUM_TYPE1_SHARDS=20
+      - NUM_TYPE2_SHARDS=20
+      - BATCH_SIZE=5
+      - INTERVAL_MS=1000
     depends_on:
-      - distributor-server
+      etcd1:
+        condition: service_healthy
     networks:
-      - shard-network
-    command: ["-mode=client", "-id=instance-1", "-server=distributor-server:50051", "-duration=300s"]
+      - shard-distributor-net
 
-  client2:
+  # Client with graceful shutdown for testing
+  graceful-shutdown-client:
     build:
       context: .
+      dockerfile: Dockerfile.client
+    environment:
+      - SERVER_ADDR=server:50051
+      - NAMESPACES=type1,type2
+      - LOG_LEVEL=debug
+      - HEARTBEAT_INTERVAL=5
+      - REPORT_INTERVAL=10
+      - SHUTDOWN_AFTER=60
+      - GRACEFUL_SHUTDOWN=true
     depends_on:
-      - distributor-server
+      server:
+        condition: service_healthy
     networks:
-      - shard-network
-    command: ["-mode=client", "-id=instance-2", "-server=distributor-server:50051", "-duration=300s"]
-
-  client3:
-    build:
-      context: .
-    depends_on:
-      - distributor-server
-    networks:
-      - shard-network
-    command: ["-mode=client", "-id=instance-3", "-server=distributor-server:50051", "-duration=300s"]
-
-  # Script to orchestrate graceful transfer simulation
-  simulation-controller:
-    # Use the host's Docker CLI to control containers
-    image: alpine:latest
-    container_name: simulation-controller
-    depends_on:
-      - client1
-      - client2
-      - client3
-    networks:
-      - shard-network
-    volumes:
-      - ./simulation:/simulation
-      - /var/run/docker.sock:/var/run/docker.sock
-    entrypoint: ["/bin/sh", "-c", "apk add --no-cache docker && /simulation/run-simulation.sh"]
-
+      - shard-distributor-net
 
 networks:
-  shard-network:
+  shard-distributor-net:
     driver: bridge

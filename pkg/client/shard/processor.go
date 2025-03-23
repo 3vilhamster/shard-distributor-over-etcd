@@ -10,7 +10,7 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/3vilhamster/shard-distributor-over-etcd/gen/proto"
+	"github.com/3vilhamster/shard-distributor-over-etcd/gen/proto/sharddistributor/v1"
 	"github.com/3vilhamster/shard-distributor-over-etcd/pkg/client/connection"
 )
 
@@ -36,14 +36,14 @@ var DefaultProcessorConfig = ProcessorConfig{
 
 // Processor manages shard assignments and their lifecycle
 type Processor struct {
+	namespace       string
 	config          ProcessorConfig
 	connectionMgr   *connection.Manager
 	stateManager    *StateManager
 	handlers        map[string]Handler
-	assignmentQueue chan *proto.ServerMessage
+	assignmentQueue chan *proto.ShardDistributorStreamResponse
 	transferSem     chan struct{}
 	logger          *zap.Logger
-	workloadType    string
 	ctx             context.Context
 	cancel          context.CancelFunc
 	wg              sync.WaitGroup
@@ -52,9 +52,9 @@ type Processor struct {
 
 // NewProcessor creates a new shard processor
 func NewProcessor(
+	namespace string,
 	connectionMgr *connection.Manager,
 	stateManager *StateManager,
-	workloadType string,
 	logger *zap.Logger,
 	config ProcessorConfig,
 ) *Processor {
@@ -76,20 +76,20 @@ func NewProcessor(
 	ctx, cancel := context.WithCancel(context.Background())
 
 	p := &Processor{
+		namespace:       namespace,
 		config:          config,
 		connectionMgr:   connectionMgr,
 		stateManager:    stateManager,
 		handlers:        make(map[string]Handler),
-		assignmentQueue: make(chan *proto.ServerMessage, config.AssignmentQueueSize),
+		assignmentQueue: make(chan *proto.ShardDistributorStreamResponse, config.AssignmentQueueSize),
 		transferSem:     make(chan struct{}, config.MaxConcurrentTransfers),
-		logger:          logger,
-		workloadType:    workloadType,
+		logger:          logger.Named("shard-processor"),
 		ctx:             ctx,
 		cancel:          cancel,
 	}
 
 	// Register for shard assignment messages
-	connectionMgr.RegisterHandler(proto.ServerMessage_SHARD_ASSIGNMENT, p.handleShardAssignment)
+	connectionMgr.RegisterHandler(proto.ShardDistributorStreamResponse_MESSAGE_TYPE_SHARD_ASSIGNMENT, p.handleShardAssignment)
 
 	// Start processing assigned shards
 	p.startAssignmentProcessor()
@@ -120,9 +120,14 @@ func (p *Processor) GetHandler(shardType string) (Handler, error) {
 }
 
 // handleShardAssignment is called when a shard assignment message is received
-func (p *Processor) handleShardAssignment(ctx context.Context, msg *proto.ServerMessage) error {
-	if msg.Type != proto.ServerMessage_SHARD_ASSIGNMENT {
+func (p *Processor) handleShardAssignment(ctx context.Context, msg *proto.ShardDistributorStreamResponse) error {
+	if msg.Type != proto.ShardDistributorStreamResponse_MESSAGE_TYPE_SHARD_ASSIGNMENT {
 		return errors.New("expected shard assignment message")
+	}
+
+	if msg.Namespace != p.namespace {
+		// Other caller
+		return nil
 	}
 
 	// Queue the assignment for processing
@@ -159,7 +164,7 @@ func (p *Processor) startAssignmentProcessor() {
 				case p.transferSem <- struct{}{}:
 					// Process the assignment in a separate goroutine
 					p.wg.Add(1)
-					go func(msg *proto.ServerMessage) {
+					go func(msg *proto.ShardDistributorStreamResponse) {
 						defer p.wg.Done()
 						defer func() { <-p.transferSem }() // Release semaphore
 
@@ -179,16 +184,13 @@ func (p *Processor) startAssignmentProcessor() {
 }
 
 // processAssignment processes a shard assignment
-func (p *Processor) processAssignment(msg *proto.ServerMessage) error {
+func (p *Processor) processAssignment(msg *proto.ShardDistributorStreamResponse) error {
 	shardID := msg.ShardId
 	action := msg.Action
 
 	p.logger.Info("Processing shard assignment",
 		zap.String("shardID", shardID),
-		zap.String("action", action.String()),
-		zap.Int32("priority", msg.Priority),
-		zap.Int64("version", msg.Version),
-		zap.Bool("isReconciliation", msg.IsReconciliation))
+		zap.String("action", action.String()))
 
 	// Extract shard type from shardID (assuming format like "type:id")
 	// This can be adjusted based on your shardID format
@@ -204,21 +206,22 @@ func (p *Processor) processAssignment(msg *proto.ServerMessage) error {
 	}
 
 	switch action {
-	case proto.ShardAssignmentAction_ASSIGN:
+	case proto.ShardAssignmentAction_SHARD_ASSIGNMENT_ACTION_ADD:
 		return p.handleAssignAction(shardID, msg, handler)
-	case proto.ShardAssignmentAction_PREPARE:
+	case proto.ShardAssignmentAction_SHARD_ASSIGNMENT_ACTION_PREPARE_ADD:
 		return p.handlePrepareAction(shardID, msg, handler)
-	case proto.ShardAssignmentAction_REVOKE:
+	case proto.ShardAssignmentAction_SHARD_ASSIGNMENT_ACTION_DROP:
 		return p.handleRevokeAction(shardID, msg, handler)
-	case proto.ShardAssignmentAction_RECONCILE:
-		return p.handleReconcileAction(shardID, msg, handler)
+	case proto.ShardAssignmentAction_SHARD_ASSIGNMENT_ACTION_PREPARE_DROP:
+		// no action for now.
+		return nil
 	default:
 		return fmt.Errorf("unknown shard assignment action: %s", action.String())
 	}
 }
 
 // handleAssignAction processes shard assignment
-func (p *Processor) handleAssignAction(shardID string, msg *proto.ServerMessage, handler Handler) error {
+func (p *Processor) handleAssignAction(shardID string, msg *proto.ShardDistributorStreamResponse, handler Handler) error {
 	// Check current state
 	currentState, err := p.stateManager.GetShardState(shardID)
 	if err != nil && !errors.Is(err, ErrShardNotFound) {
@@ -240,9 +243,7 @@ func (p *Processor) handleAssignAction(shardID string, msg *proto.ServerMessage,
 	err = p.stateManager.UpdateShardState(shardID, &ShardState{
 		ShardID:     shardID,
 		Status:      ShardStatusActivating,
-		Version:     msg.Version,
 		LastUpdated: time.Now(),
-		Priority:    msg.Priority,
 		Metadata:    map[string]string{},
 	})
 	if err != nil {
@@ -253,7 +254,7 @@ func (p *Processor) handleAssignAction(shardID string, msg *proto.ServerMessage,
 	p.logger.Info("Activating shard", zap.String("shardID", shardID))
 
 	// Call the handler to activate the shard
-	activateErr := handler.Activate(activationCtx, shardID, msg.Version)
+	activateErr := handler.Activate(activationCtx, shardID)
 
 	// Update state based on result
 	if activateErr != nil {
@@ -265,10 +266,8 @@ func (p *Processor) handleAssignAction(shardID string, msg *proto.ServerMessage,
 		if updateErr := p.stateManager.UpdateShardState(shardID, &ShardState{
 			ShardID:      shardID,
 			Status:       ShardStatusError,
-			Version:      msg.Version,
 			LastUpdated:  time.Now(),
 			ErrorMessage: activateErr.Error(),
-			Priority:     msg.Priority,
 		}); updateErr != nil {
 			p.logger.Error("Failed to update shard state after activation error",
 				zap.String("shardID", shardID),
@@ -282,9 +281,7 @@ func (p *Processor) handleAssignAction(shardID string, msg *proto.ServerMessage,
 	err = p.stateManager.UpdateShardState(shardID, &ShardState{
 		ShardID:     shardID,
 		Status:      ShardStatusActive,
-		Version:     msg.Version,
 		LastUpdated: time.Now(),
-		Priority:    msg.Priority,
 	})
 	if err != nil {
 		p.logger.Error("Failed to update shard state after successful activation",
@@ -299,7 +296,7 @@ func (p *Processor) handleAssignAction(shardID string, msg *proto.ServerMessage,
 }
 
 // handlePrepareAction processes shard preparation
-func (p *Processor) handlePrepareAction(shardID string, msg *proto.ServerMessage, handler Handler) error {
+func (p *Processor) handlePrepareAction(shardID string, msg *proto.ShardDistributorStreamResponse, handler Handler) error {
 	// Check current state
 	currentState, err := p.stateManager.GetShardState(shardID)
 	if err != nil && !errors.Is(err, ErrShardNotFound) {
@@ -323,9 +320,7 @@ func (p *Processor) handlePrepareAction(shardID string, msg *proto.ServerMessage
 	err = p.stateManager.UpdateShardState(shardID, &ShardState{
 		ShardID:     shardID,
 		Status:      ShardStatusPreparing,
-		Version:     msg.Version,
 		LastUpdated: time.Now(),
-		Priority:    msg.Priority,
 		Metadata:    map[string]string{},
 	})
 	if err != nil {
@@ -336,7 +331,7 @@ func (p *Processor) handlePrepareAction(shardID string, msg *proto.ServerMessage
 	p.logger.Info("Preparing shard", zap.String("shardID", shardID))
 
 	// Call the handler to prepare the shard
-	prepareErr := handler.Prepare(prepareCtx, shardID, msg.Version)
+	prepareErr := handler.Prepare(prepareCtx, shardID)
 
 	// Update state based on result
 	if prepareErr != nil {
@@ -348,10 +343,8 @@ func (p *Processor) handlePrepareAction(shardID string, msg *proto.ServerMessage
 		if updateErr := p.stateManager.UpdateShardState(shardID, &ShardState{
 			ShardID:      shardID,
 			Status:       ShardStatusError,
-			Version:      msg.Version,
 			LastUpdated:  time.Now(),
 			ErrorMessage: prepareErr.Error(),
-			Priority:     msg.Priority,
 		}); updateErr != nil {
 			p.logger.Error("Failed to update shard state after preparation error",
 				zap.String("shardID", shardID),
@@ -365,9 +358,7 @@ func (p *Processor) handlePrepareAction(shardID string, msg *proto.ServerMessage
 	err = p.stateManager.UpdateShardState(shardID, &ShardState{
 		ShardID:     shardID,
 		Status:      ShardStatusPrepared,
-		Version:     msg.Version,
 		LastUpdated: time.Now(),
-		Priority:    msg.Priority,
 	})
 	if err != nil {
 		p.logger.Error("Failed to update shard state after successful preparation",
@@ -382,7 +373,7 @@ func (p *Processor) handlePrepareAction(shardID string, msg *proto.ServerMessage
 }
 
 // handleRevokeAction processes shard revocation
-func (p *Processor) handleRevokeAction(shardID string, msg *proto.ServerMessage, handler Handler) error {
+func (p *Processor) handleRevokeAction(shardID string, msg *proto.ShardDistributorStreamResponse, handler Handler) error {
 	// Check current state
 	currentState, err := p.stateManager.GetShardState(shardID)
 	if err != nil {
@@ -410,9 +401,7 @@ func (p *Processor) handleRevokeAction(shardID string, msg *proto.ServerMessage,
 	err = p.stateManager.UpdateShardState(shardID, &ShardState{
 		ShardID:     shardID,
 		Status:      ShardStatusDeactivating,
-		Version:     msg.Version,
 		LastUpdated: time.Now(),
-		Priority:    msg.Priority,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to update shard state: %w", err)
@@ -422,7 +411,7 @@ func (p *Processor) handleRevokeAction(shardID string, msg *proto.ServerMessage,
 	p.logger.Info("Deactivating shard", zap.String("shardID", shardID))
 
 	// Call the handler to deactivate the shard
-	deactivateErr := handler.Deactivate(deactivationCtx, shardID, msg.Version)
+	deactivateErr := handler.Deactivate(deactivationCtx, shardID)
 
 	// Update state based on result
 	if deactivateErr != nil {
@@ -434,10 +423,8 @@ func (p *Processor) handleRevokeAction(shardID string, msg *proto.ServerMessage,
 		if updateErr := p.stateManager.UpdateShardState(shardID, &ShardState{
 			ShardID:      shardID,
 			Status:       ShardStatusError,
-			Version:      msg.Version,
 			LastUpdated:  time.Now(),
 			ErrorMessage: deactivateErr.Error(),
-			Priority:     msg.Priority,
 		}); updateErr != nil {
 			p.logger.Error("Failed to update shard state after deactivation error",
 				zap.String("shardID", shardID),
@@ -451,9 +438,7 @@ func (p *Processor) handleRevokeAction(shardID string, msg *proto.ServerMessage,
 	err = p.stateManager.UpdateShardState(shardID, &ShardState{
 		ShardID:     shardID,
 		Status:      ShardStatusInactive,
-		Version:     msg.Version,
 		LastUpdated: time.Now(),
-		Priority:    msg.Priority,
 	})
 	if err != nil {
 		p.logger.Error("Failed to update shard state after successful deactivation",
@@ -471,65 +456,6 @@ func (p *Processor) handleRevokeAction(shardID string, msg *proto.ServerMessage,
 	}
 
 	// Acknowledge the revocation
-	return p.connectionMgr.AcknowledgeAssignment(p.ctx, shardID)
-}
-
-// handleReconcileAction processes shard reconciliation
-func (p *Processor) handleReconcileAction(shardID string, msg *proto.ServerMessage, handler Handler) error {
-	// Check current state
-	currentState, err := p.stateManager.GetShardState(shardID)
-	if err != nil && !errors.Is(err, ErrShardNotFound) {
-		return fmt.Errorf("failed to get shard state: %w", err)
-	}
-
-	// If shard not assigned to us, just acknowledge
-	if currentState == nil {
-		p.logger.Debug("Shard not found during reconciliation, acknowledging",
-			zap.String("shardID", shardID))
-		return p.connectionMgr.AcknowledgeAssignment(p.ctx, shardID)
-	}
-
-	// If shard is in error state, try to recover
-	if currentState.Status == ShardStatusError {
-		p.logger.Info("Attempting to recover shard in error state",
-			zap.String("shardID", shardID),
-			zap.String("errorMessage", currentState.ErrorMessage))
-
-		// Depending on the previous state, try to recover
-		// Here we use simple logic: if version matches, try to reactivate
-		if currentState.Version == msg.Version {
-			// Reuse the assign handler for recovery
-			return p.handleAssignAction(shardID, msg, handler)
-		}
-	}
-
-	// For active shards, check version
-	if currentState.Status == ShardStatusActive && currentState.Version != msg.Version {
-		p.logger.Info("Version mismatch during reconciliation, updating shard",
-			zap.String("shardID", shardID),
-			zap.Int64("currentVersion", currentState.Version),
-			zap.Int64("newVersion", msg.Version))
-
-		// Update the shard (handle as new assignment)
-		return p.handleAssignAction(shardID, msg, handler)
-	}
-
-	// For prepared shards
-	if currentState.Status == ShardStatusPrepared && msg.Priority > currentState.Priority {
-		p.logger.Info("Prepared shard has higher priority during reconciliation, activating",
-			zap.String("shardID", shardID),
-			zap.Int32("currentPriority", currentState.Priority),
-			zap.Int32("newPriority", msg.Priority))
-
-		// Activate the prepared shard
-		return p.handleAssignAction(shardID, msg, handler)
-	}
-
-	// For other cases, just acknowledge the reconciliation
-	p.logger.Debug("No action needed for reconciliation, acknowledging",
-		zap.String("shardID", shardID),
-		zap.String("status", currentState.Status.String()))
-
 	return p.connectionMgr.AcknowledgeAssignment(p.ctx, shardID)
 }
 
