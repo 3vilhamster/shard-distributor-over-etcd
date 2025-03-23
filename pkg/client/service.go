@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"go.uber.org/fx"
 	"go.uber.org/zap"
 
 	"github.com/3vilhamster/shard-distributor-over-etcd/gen/proto/sharddistributor/v1"
@@ -31,52 +32,54 @@ type Service struct {
 	hanlderRegistry *shard.HandlerRegistry
 }
 
-// NewService creates a new client service
-func NewService(cfg config.ServiceConfig, logger *zap.Logger, hanlderRegistry *shard.HandlerRegistry) (*Service, error) {
-	if logger == nil {
-		var err error
-		logger, err = zap.NewProduction()
-		if err != nil {
-			return nil, fmt.Errorf("failed to create logger: %w", err)
-		}
-	}
+type ServiceParams struct {
+	fx.In
 
-	if cfg.ServerAddr == "" {
+	Cfg     config.ServiceConfig
+	Logger  *zap.Logger
+	Handler *shard.HandlerRegistry
+
+	Lifecycle fx.Lifecycle
+}
+
+// NewService creates a new client service
+func NewService(params ServiceParams) (*Service, error) {
+	if params.Cfg.ServerAddr == "" {
 		return nil, fmt.Errorf("server address is required")
 	}
 
-	if cfg.InstanceID == "" {
+	if params.Cfg.InstanceID == "" {
 		return nil, fmt.Errorf("instance ID is required")
 	}
 
 	// Set default config values if not provided
-	if cfg.ReconnectBackoff == 0 {
-		cfg.ReconnectBackoff = config.DefaultServiceConfig.ReconnectBackoff
+	if params.Cfg.ReconnectBackoff == 0 {
+		params.Cfg.ReconnectBackoff = config.DefaultServiceConfig.ReconnectBackoff
 	}
-	if cfg.MaxReconnectBackoff == 0 {
-		cfg.MaxReconnectBackoff = config.DefaultServiceConfig.MaxReconnectBackoff
+	if params.Cfg.MaxReconnectBackoff == 0 {
+		params.Cfg.MaxReconnectBackoff = config.DefaultServiceConfig.MaxReconnectBackoff
 	}
-	if cfg.ReconnectJitter == 0 {
-		cfg.ReconnectJitter = config.DefaultServiceConfig.ReconnectJitter
+	if params.Cfg.ReconnectJitter == 0 {
+		params.Cfg.ReconnectJitter = config.DefaultServiceConfig.ReconnectJitter
 	}
-	if cfg.HeartbeatInterval == 0 {
-		cfg.HeartbeatInterval = config.DefaultServiceConfig.HeartbeatInterval
+	if params.Cfg.HeartbeatInterval == 0 {
+		params.Cfg.HeartbeatInterval = config.DefaultServiceConfig.HeartbeatInterval
 	}
-	if cfg.HealthReportInterval == 0 {
-		cfg.HealthReportInterval = config.DefaultServiceConfig.HealthReportInterval
+	if params.Cfg.HealthReportInterval == 0 {
+		params.Cfg.HealthReportInterval = config.DefaultServiceConfig.HealthReportInterval
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// Create instance info
 	instanceInfo := &proto.InstanceInfo{
-		InstanceId: cfg.InstanceID,
+		InstanceId: params.Cfg.InstanceID,
 	}
 
 	// Create connection manager
 	connMgr := connection.NewManager(
-		cfg.ServerAddr,
-		cfg.InstanceID,
+		params.Cfg.ServerAddr,
+		params.Cfg.InstanceID,
 		instanceInfo,
 	)
 
@@ -87,25 +90,25 @@ func NewService(cfg config.ServiceConfig, logger *zap.Logger, hanlderRegistry *s
 	handlerReg := shard.NewHandlerRegistry()
 
 	service := &Service{
-		config:          cfg,
-		logger:          logger,
+		config:          params.Cfg,
+		logger:          params.Logger,
 		connectionMgr:   connMgr,
 		stateManager:    stateMgr,
 		handlerReg:      handlerReg,
 		readyCh:         make(chan struct{}),
 		ctx:             ctx,
 		cancel:          cancel,
-		hanlderRegistry: hanlderRegistry,
+		hanlderRegistry: params.Handler,
 		shardProcessors: make(map[string]*shard.Processor),
 	}
 
-	for _, ns := range cfg.Namespaces {
+	for _, ns := range params.Cfg.Namespaces {
 		service.shardProcessors[ns] = shard.NewProcessor(
 			ns,
 			connMgr,
 			stateMgr,
-			logger,
-			cfg.ShardProcessorConfig,
+			params.Logger,
+			params.Cfg.ShardProcessorConfig,
 		)
 
 		if err := service.RegisterShardHandler(ns); err != nil {
@@ -115,6 +118,11 @@ func NewService(cfg config.ServiceConfig, logger *zap.Logger, hanlderRegistry *s
 		}
 
 	}
+
+	params.Lifecycle.Append(fx.Hook{
+		OnStart: service.Start,
+		OnStop:  service.Stop,
+	})
 
 	return service, nil
 }
